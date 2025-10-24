@@ -1,0 +1,198 @@
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use gcp_auth::AuthenticationManager;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{sync::Arc, time::Duration};
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
+
+// use crate::backend::ProcessorBackend;
+
+
+use crate::backend::ProcessorBackend;
+
+/// Struktura reprezentująca status wykonania Cloud Run Job (GET /executions/{id})
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExecutionStatus {
+    pub name: String,
+    pub uid: Option<String>,
+    pub create_time: Option<String>,
+    pub update_time: Option<String>,
+    pub state: Option<String>, // RUNNING / SUCCEEDED / FAILED / CANCELLED
+    pub task_count: Option<u32>,
+    pub succeeded_count: Option<u32>,
+    pub failed_count: Option<u32>,
+    pub cancelled_count: Option<u32>,
+}
+
+/// Produkcyjny backend dla Cloud Run Jobs z monitoringiem executions
+pub struct CloudRunBackend {
+    pub project: String,
+    pub region: String,
+    client: Client,
+    token_mgr: Arc<AuthenticationManager>,
+}
+
+impl CloudRunBackend {
+    pub async fn new(project: String, region: String) -> Result<Self> {
+        let mgr = AuthenticationManager::new().await?;
+        let client = Client::builder().build()?;
+        Ok(Self {
+            project,
+            region,
+            client,
+            token_mgr: Arc::new(mgr),
+        })
+    }
+
+    async fn get_token(&self) -> Result<String> {
+        let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
+        let token = self.token_mgr.get_token(scopes).await?;
+        Ok(token.as_str().to_string())
+    }
+
+    fn jobs_base(&self) -> String {
+        format!(
+            "https://run.googleapis.com/v2/projects/{}/locations/{}",
+            self.project, self.region
+        )
+    }
+
+    /// POST /jobs/{job}:run – uruchamia Cloud Run Job
+    async fn start_job(&self, job_name: &str, json_payload: &Value) -> Result<String> {
+        let token = self.get_token().await?;
+        let url = format!("{}/jobs/{}:run", self.jobs_base(), job_name);
+
+        info!(%job_name, "Wywołuję Cloud Run Job...");
+        let res = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "overrides": {
+                    "containerOverrides": [{
+                        "args": [ serde_json::to_string(json_payload)? ]
+                    }]
+                }
+            }))
+            .send()
+            .await
+            .context("błąd HTTP POST /run")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("Job execution HTTP error {}: {}", status, txt);
+        }
+
+
+        let body: Value = res.json().await?;
+        let exec_id = body["name"]
+            .as_str()
+            .unwrap_or("unknown-exec-id")
+            .to_string();
+
+        info!(%exec_id, %job_name, "Cloud Run Job wystartował");
+        Ok(exec_id)
+    }
+
+    /// GET /executions/{id} – pobiera status joba
+    pub async fn get_execution_status(&self, exec_id: &str) -> Result<ExecutionStatus> {
+        let token = self.get_token().await?;
+        let url = format!(
+            "https://run.googleapis.com/v2/projects/{}/locations/{}/executions/{}",
+            self.project, self.region, exec_id
+        );
+
+        let res = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("błąd GET execution")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("Job execution HTTP error {}: {}", status, txt);
+        }
+
+
+        let status: ExecutionStatus = res.json().await?;
+        Ok(status)
+    }
+
+    /// Polluje status co `interval` aż do SUCCEEDED/FAILED/TIMEOUT
+    pub async fn poll_until_done(
+        &self,
+        exec_id: &str,
+        max_wait: Duration,
+        interval: Duration,
+    ) -> Result<String> {
+        let start = std::time::Instant::now();
+
+        loop {
+            let status = self.get_execution_status(exec_id).await?;
+            let state = status.state.clone().unwrap_or_default();
+            debug!(%exec_id, %state, "Execution status poll");
+
+            match state.as_str() {
+                "SUCCEEDED" => {
+                    info!(%exec_id, "Execution SUCCEEDED");
+                    return Ok(state);
+                }
+                "FAILED" | "CANCELLED" => {
+                    error!(%exec_id, "Execution FAILED");
+                    anyhow::bail!("Execution {} failed ({})", exec_id, state)
+                }
+                "RUNNING" | "QUEUED" => {
+                    if start.elapsed() > max_wait {
+                        error!(%exec_id, "Execution TIMED OUT");
+                        anyhow::bail!("Execution {} timed out", exec_id)
+                    }
+                    sleep(interval).await;
+                }
+                _ => {
+                    warn!(%exec_id, %state, "Execution w stanie nieznanym, kontynuuję polling...");
+                    sleep(interval).await;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessorBackend for CloudRunBackend {
+    async fn dispatch_job(&self, job_name: &str, json_payload: &Value) -> Result<String> {
+        self.start_job(job_name, json_payload).await
+    }
+
+    async fn ping(&self, job_name: &str) -> Result<()> {
+        let token = self.get_token().await?;
+        let url = format!("{}/jobs/{}", self.jobs_base(), job_name);
+        let res = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("błąd GET job")?;
+
+        if res.status().is_success() {
+            info!(%job_name, "Job OK (ping)");
+            Ok(())
+
+        } else {
+            warn!(%job_name, status=%res.status(), "Ping nie powiódł się");
+            anyhow::bail!("Ping failed {}", res.status())
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+}
