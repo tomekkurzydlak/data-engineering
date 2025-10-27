@@ -1,0 +1,339 @@
+//! UDR Dispatcher (process_id jako u64)
+
+mod backend;
+mod cloud_run;
+
+use backend::ProcessorBackend;
+use cloud_run::CloudRunBackend;
+
+use anyhow::{Context, Result};
+use clap::{ArgAction, Parser, ValueHint};
+use dashmap::DashSet;
+use futures::{stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    process::Command,
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+};
+use tokio_postgres::{Client, NoTls};
+use tokio_stream::wrappers::IntervalStream;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::prelude::*;
+use uuid::Uuid;
+
+// ======================== CLI & CONFIG ========================
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "udr-dispatcher", version, about = "Universal Data Repo Dispatcher")]
+struct Cli {
+    /// Global process/session id nadawany przez orkiestrator
+    #[arg(long, value_hint = ValueHint::Other)]
+    process_id: u64,
+
+    /// GCP project id (przekazywany do jobów)
+    #[arg(long)]
+    gcp_project: Option<String>,
+
+    /// DSN do Postgresa
+    #[arg(long)]
+    pg_dsn: Option<String>,
+
+    #[arg(long)]
+    pg_host: Option<String>,
+    #[arg(long, default_value_t = 5432)]
+    pg_port: u16,
+    #[arg(long)]
+    pg_user: Option<String>,
+    #[arg(long)]
+    pg_password: Option<String>,
+    #[arg(long)]
+    pg_dbname: Option<String>,
+
+    #[arg(long)]
+    payload: Option<String>,
+
+    #[arg(long)]
+    payload_file: Option<PathBuf>,
+
+    #[arg(long)]
+    export_dir: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+
+    #[arg(long, action=ArgAction::SetTrue)]
+    dry_run: bool,
+
+    #[arg(long, default_value_t = 30)]
+    poll_interval_secs: u64,
+
+    #[arg(long, default_value_t = 0)]
+    ping_interval_secs: u64,
+
+    #[arg(long, default_value = "udr_job_status")]
+    notify_channel: String,
+
+    #[arg(long, default_value = "udr-meta-extractor")]
+    meta_job: String,
+
+    #[arg(long, default_value = "pdf:pdf-processing,md:md-processing,docx:docx-processing")]
+    ext_jobs: String,
+}
+
+#[derive(Debug, Clone)]
+struct AppConfig {
+    process_id: u64,
+    gcp_project: Option<String>,
+    pg_dsn: Option<String>,
+    pg_host: Option<String>,
+    pg_port: u16,
+    pg_user: Option<String>,
+    pg_password: Option<String>,
+    pg_dbname: Option<String>,
+    max_retries: u32,
+    dry_run: bool,
+    poll_interval: Duration,
+    ping_interval: Option<Duration>,
+    notify_channel: String,
+    meta_job: String,
+    ext_jobs: HashMap<String, String>,
+    export_dir: Option<PathBuf>,
+}
+
+impl From<Cli> for AppConfig {
+    fn from(c: Cli) -> Self {
+        let ext_jobs = parse_ext_jobs(&c.ext_jobs);
+        let ping_interval = if c.ping_interval_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(c.ping_interval_secs))
+        };
+        Self {
+            process_id: c.process_id,
+            gcp_project: c.gcp_project,
+            pg_dsn: c.pg_dsn,
+            pg_host: c.pg_host,
+            pg_port: c.pg_port,
+            pg_user: c.pg_user,
+            pg_password: c.pg_password,
+            pg_dbname: c.pg_dbname,
+            max_retries: c.max_retries,
+            dry_run: c.dry_run,
+            poll_interval: Duration::from_secs(c.poll_interval_secs),
+            ping_interval,
+            notify_channel: c.notify_channel,
+            meta_job: c.meta_job,
+            ext_jobs,
+            export_dir: c.export_dir,
+        }
+    }
+}
+
+fn parse_ext_jobs(s: &str) -> HashMap<String, String> {
+    s.split(',')
+        .filter_map(|kv| {
+            let mut it = kv.split(':');
+            let k = it.next()?.trim().to_lowercase();
+            let v = it.next()?.trim().to_string();
+            Some((k, v))
+        })
+        .collect()
+}
+
+// ======================== DOMAIN ========================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileTask {
+    file_path: String,
+    file_id: String,
+    export_path: Option<String>,
+}
+
+// ======================== STATUS ENUM ========================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    MetaDispatched,
+    MetaExtracted,
+    Dispatched,
+    Completed,
+    Finished,
+    Failed,
+    TimedOut,
+    Redispatched,
+    Other,
+}
+
+impl Status {
+    fn from_str_loose(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "META_DISPATCHED" => Status::MetaDispatched,
+            "META_EXTRACTED" => Status::MetaExtracted,
+            "DISPATCHED" => Status::Dispatched,
+            "COMPLETED" => Status::Completed,
+            "FINISHED" => Status::Finished,
+            "FAILED" => Status::Failed,
+            "TIMED_OUT" => Status::TimedOut,
+            "REDISPATCHED" => Status::Redispatched,
+            _ => Status::Other,
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Status::MetaDispatched => "META_DISPATCHED",
+            Status::MetaExtracted => "META_EXTRACTED",
+            Status::Dispatched => "DISPATCHED",
+            Status::Completed => "COMPLETED",
+            Status::Finished => "FINISHED",
+            Status::Failed => "FAILED",
+            Status::TimedOut => "TIMED_OUT",
+            Status::Redispatched => "REDISPATCHED",
+            Status::Other => "OTHER",
+        }
+    }
+}
+
+// ======================== DB LAYER ========================
+
+struct Db {
+    client: Client,
+}
+
+impl Db {
+    async fn connect(cfg: &AppConfig) -> Result<Self> {
+        let dsn = if let Some(dsn) = &cfg.pg_dsn {
+            dsn.clone()
+        } else {
+            format!(
+                "host={} port={} user={} password={} dbname={}",
+                cfg.pg_host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                cfg.pg_port,
+                cfg.pg_user.clone().unwrap_or_else(|| "postgres".into()),
+                cfg.pg_password.clone().unwrap_or_default(),
+                cfg.pg_dbname.clone().unwrap_or_else(|| "postgres".into())
+            )
+        };
+        info!(%dsn, "Łączenie z Postgres (NoTls)...");
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                error!(error=?e, "Błąd tła połączenia z Postgres");
+            }
+        });
+        Ok(Self { client })
+    }
+
+    async fn init_session(&self, dispatcher_run_id: Uuid, process_id: u64) -> Result<()> {
+        let q = r#"
+            insert into dispatcher_session(dispatcher_run_id, process_id, start_ts)
+            values ($1, $2, now())
+            on conflict (dispatcher_run_id) do nothing
+        "#;
+        self.client
+            .execute(q, &[&dispatcher_run_id, &(process_id as i64)])
+            .await?;
+        Ok(())
+    }
+
+    async fn status_of_all(&self, process_id: u64) -> Result<HashMap<String, Status>> {
+        let q = "select file_id, status from files where process_id = $1";
+        let rows = self.client.query(q, &[&(process_id as i64)]).await?;
+        let mut map = HashMap::new();
+        for r in rows {
+            let file_id: String = r.get(0);
+            let st: String = r.get(1);
+            map.insert(file_id, Status::from_str_loose(&st));
+        }
+        Ok(map)
+    }
+
+    async fn set_status(&self, process_id: u64, file_id: &str, status: Status) -> Result<()> {
+        let q = r#"
+            update files set status=$1, update_ts=now()
+            where process_id=$2 and file_id=$3
+        "#;
+        self.client
+            .execute(q, &[&status.as_str(), &(process_id as i64), &file_id])
+            .await?;
+        Ok(())
+    }
+}
+
+// ======================== DISPATCHER ========================
+
+struct Dispatcher {
+    cfg: AppConfig,
+    backend: Arc<dyn ProcessorBackend>,
+    db: Option<Arc<Db>>,
+    dispatcher_run_id: Uuid,
+}
+
+impl Dispatcher {
+    async fn new(cfg: AppConfig) -> Result<Self> {
+        let dispatcher_run_id = Uuid::new_v4();
+        let backend: Arc<dyn ProcessorBackend> = if cfg.dry_run {
+            Arc::new(crate::backend::DryRunBackend)
+        } else {
+            let project = cfg
+                .gcp_project
+                .clone()
+                .expect("parametr --gcp-project jest wymagany w trybie produkcyjnym");
+            let region =
+                std::env::var("GCP_REGION").unwrap_or_else(|_| "europe-central2".to_string());
+            Arc::new(CloudRunBackend::new(project, region).await?)
+        };
+        let db = if cfg.dry_run {
+            None
+        } else {
+            Some(Arc::new(Db::connect(&cfg).await?))
+        };
+        Ok(Self {
+            cfg,
+            backend,
+            db,
+            dispatcher_run_id,
+        })
+    }
+
+    async fn all_completed(db: &Db, process_id: u64) -> Result<bool> {
+        let statuses = db.status_of_all(process_id).await?;
+        Ok(!statuses.is_empty() && statuses.values().all(|s| *s == Status::Completed))
+    }
+}
+
+// ======================== MAIN ========================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    let cli = Cli::parse();
+    let cfg: AppConfig = cli.clone().into();
+
+    let dispatcher = Dispatcher::new(cfg).await?;
+    info!("Dispatcher uruchomiony z process_id = {}", dispatcher.cfg.process_id);
+
+    // test DB
+    if let Some(db) = &dispatcher.db {
+        db.init_session(dispatcher.dispatcher_run_id, dispatcher.cfg.process_id)
+            .await?;
+        info!("Sesja zainicjowana w DB");
+    }
+
+    Ok(())
+}
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,udr_dispatcher=info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false))
+        .init();
+}
