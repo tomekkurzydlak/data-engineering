@@ -1,0 +1,1403 @@
+//! ===========================================================================
+//!  UDR Dispatcher — SCALONA WERSJA (pełna funkcjonalność)
+//!
+//!  Zachowane funkcjonalności ze "starego" kodu:
+//!   - LISTEN/NOTIFY (Postgres)    ✅
+//!   - fallback polling (DB)       ✅
+//!   - periodic ping Cloud Run     ✅
+//!   - finalizacja meta.json       ✅
+//!   - retry/REDISPATCHED          ✅
+//!   - statusy w DB (set/get)      ✅
+//!   - dry-run                      ✅
+//!
+//!  Nowe funkcjonalności (dynamiczny pipeline):
+//!   - payload zawiera listę kroków z kolejnością exec_process_seq             ✅
+//!   - domyślnie grupowanie per obraz (exec_object_nm) i batch-size            ✅
+//!   - tryb sekwencyjny per plik (--sequential-mode)                           ✅
+//!   - bariera między krokami (domyślnie) lub niezależne kroki (--independent-steps) ✅
+//!
+//!  Payload (przykład):
+//!  [
+//!    {
+//!      "file_id": "57",
+//!      "gcs_file_uri": "gs://bucket/path/file.pdf",
+//!      "processes": [
+//!        { "exec_process_seq":1, "process_cd":"collect_basic_meta", "exec_env":"CLOUD_RUN", "exec_object_nm":"collect_basic_meta:1.0.0" },
+//!        { "exec_process_seq":2, "process_cd":"process_pdf",        "exec_env":"CLOUD_RUN", "exec_object_nm":"process_pdf:1.1.0" },
+//!        { "exec_process_seq":3, "process_cd":"export_meta",        "exec_env":"CLOUD_RUN", "exec_object_nm":"export_meta:1.2.0" }
+//!      ]
+//!    }
+//!  ]
+//!
+//!  Noty:
+//!   - Finalizacja meta.json odpala, gdy dla danej sesji wszystkie pliki są COMPLETED.
+//!     Następnie ustawia FINISHED dla COMPLETED i kończy.
+//!   - Pingi Cloud Run działają okresowo, lista jobów zbierana z payloadu (exec_object_nm).
+//!
+//! ===========================================================================
+
+mod backend;
+mod cloud_run;
+
+use crate::backend::ProcessorBackend;
+use crate::cloud_run::CloudRunBackend;
+
+use anyhow::{Context, Result};
+use clap::{ArgAction, Parser, ValueHint};
+use dashmap::DashSet;
+use futures::{stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_postgres::{Client, NoTls};
+use tokio_stream::wrappers::IntervalStream;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+// =====================================================================================
+// CLI
+// =====================================================================================
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "udr-dispatcher",
+    version,
+    about = "Universal Data Repo Dispatcher (Dynamic pipelines, Cloud Run Jobs, LISTEN/NOTIFY)"
+)]
+struct Cli {
+    /// Globalny identyfikator procesu (sesji) nadany przez orkiestrator
+    #[arg(long, value_parser, value_hint = ValueHint::Other)]
+    process_id: String,
+
+    /// GCP Project ID – wymagany poza dry-run
+    #[arg(long)]
+    gcp_project: Option<String>,
+
+    /// DSN do Postgresa (prosty, preferowany)
+    #[arg(long, value_hint = ValueHint::Other)]
+    pg_dsn: Option<String>,
+
+    /// JSON payload – lista FileProcess – alternatywa dla --payload-file
+    #[arg(long)]
+    payload: Option<String>,
+
+    /// Ścieżka do pliku z JSON payload – alternatywa dla --payload
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    payload_file: Option<PathBuf>,
+
+    /// Gdzie finalnie zapisać meta.json (folder lub pełna ścieżka pliku)
+    #[arg(long, value_hint = ValueHint::AnyPath)]
+    export_dir: Option<PathBuf>,
+
+    /// Dry run – bez DB i bez faktycznych wywołań Cloud Run
+    #[arg(long, action = ArgAction::SetTrue)]
+    dry_run: bool,
+
+    /// Co ile sekund fallback polling statusów
+    #[arg(long, default_value_t = 30)]
+    poll_interval_secs: u64,
+
+    /// Nazwa kanału LISTEN/NOTIFY w Postgresie
+    #[arg(long, default_value = "udr_job_status")]
+    notify_channel: String,
+
+    /// Tryb sekwencyjny per plik (zamiast grupowania per obraz)
+    #[arg(long, action = ArgAction::SetTrue)]
+    sequential_mode: bool,
+
+    /// Tryb niezależnych kroków – bez bariery między krokami
+    #[arg(long, action = ArgAction::SetTrue)]
+    independent_steps: bool,
+
+    /// Docelowy rozmiar batcha do jednego joba (gdy grupujemy)
+    #[arg(long, default_value_t = 10)]
+    batch_size: usize,
+
+    /// Interwał pingowania jobów (0 = wyłączone)
+    #[arg(long, default_value_t = 0)]
+    ping_interval_secs: u64,
+
+    /// Maksymalna liczba retry dla niepowodzeń kroku (independent-steps)
+    #[arg(long, default_value_t = 3)]
+    retry_max: u32,
+
+    /// Backoff (sekundy) między retry (independent-steps)
+    #[arg(long, default_value_t = 20)]
+    retry_backoff_secs: u64,
+
+    /// Ile maksymalnie powtórzeń (ponowień) na plik (dla REDISPATCHED z DB)
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+}
+
+// =====================================================================================
+// Config
+// =====================================================================================
+
+#[derive(Debug, Clone)]
+struct AppConfig {
+    process_id: String,
+    gcp_project: Option<String>,
+    pg_dsn: Option<String>,
+    export_dir: Option<PathBuf>,
+    dry_run: bool,
+    poll_interval: Duration,
+    notify_channel: String,
+    sequential_mode: bool,
+    independent_steps: bool,
+    batch_size: usize,
+    ping_interval: Option<Duration>,
+    retry_max: u32,
+    retry_backoff: Duration,
+    max_retries: u32,
+}
+
+impl From<Cli> for AppConfig {
+    fn from(c: Cli) -> Self {
+        Self {
+            process_id: c.process_id,
+            gcp_project: c.gcp_project,
+            pg_dsn: c.pg_dsn,
+            export_dir: c.export_dir,
+            dry_run: c.dry_run,
+            poll_interval: Duration::from_secs(c.poll_interval_secs),
+            notify_channel: c.notify_channel,
+            sequential_mode: c.sequential_mode,
+            independent_steps: c.independent_steps,
+            batch_size: c.batch_size.max(1),
+            ping_interval: if c.ping_interval_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(c.ping_interval_secs))
+            },
+            retry_max: c.retry_max,
+            retry_backoff: Duration::from_secs(c.retry_backoff_secs),
+            max_retries: c.max_retries,
+        }
+    }
+}
+
+// =====================================================================================
+// Domain
+// =====================================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProcessStep {
+    exec_process_seq: u32,
+    process_cd: String,
+    exec_env: String,
+    exec_object_nm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileProcess {
+    file_id: String,
+    gcs_file_uri: String,
+    processes: Vec<ProcessStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Status {
+    New,
+    MetaDispatched,
+    MetaExtracted,
+    Dispatched,
+    Completed,
+    Finished,
+    Failed,
+    TimedOut,
+    Redispatched,
+    Other,
+}
+
+impl Status {
+    fn from_str_loose(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "NEW" => Status::New,
+            "META_DISPATCHED" => Status::MetaDispatched,
+            "META_EXTRACTED" => Status::MetaExtracted,
+            "DISPATCHED" => Status::Dispatched,
+            "COMPLETED" => Status::Completed,
+            "FINISHED" => Status::Finished,
+            "FAILED" => Status::Failed,
+            "TIMED_OUT" => Status::TimedOut,
+            "REDISPATCHED" => Status::Redispatched,
+            _ => Status::Other,
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Status::New => "NEW",
+            Status::MetaDispatched => "META_DISPATCHED",
+            Status::MetaExtracted => "META_EXTRACTED",
+            Status::Dispatched => "DISPATCHED",
+            Status::Completed => "COMPLETED",
+            Status::Finished => "FINISHED",
+            Status::Failed => "FAILED",
+            Status::TimedOut => "TIMED_OUT",
+            Status::Redispatched => "REDISPATCHED",
+            Status::Other => "OTHER",
+        }
+    }
+}
+
+// =====================================================================================
+// DB layer
+// =====================================================================================
+
+struct Db {
+    client: Client,
+}
+
+impl Db {
+    async fn connect(cfg: &AppConfig) -> Result<Self> {
+        let dsn = cfg
+            .pg_dsn
+            .clone()
+            .unwrap_or_else(|| "host=127.0.0.1 user=postgres dbname=postgres".into());
+        info!(%dsn, "Łączenie z Postgres (NoTls)...");
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                error!(error=?e, "Błąd tła połączenia z Postgres");
+            }
+        });
+        Ok(Self { client })
+    }
+
+    async fn init_session(&self, dispatcher_run_id: Uuid, process_id: &str) -> Result<()> {
+        let q = r#"
+            insert into dispatcher_session(dispatcher_run_id, process_id, start_ts)
+            values ($1, $2, now())
+            on conflict (dispatcher_run_id) do nothing
+        "#;
+        self.client.execute(q, &[&dispatcher_run_id, &process_id]).await?;
+        Ok(())
+    }
+
+    async fn add_incoming_if_absent(&self, process_id: &str, files: &[FileProcess]) -> Result<()> {
+        // Zostawiamy zgodność ze starą tabelą: file_path/export_path opcjonalne
+        let q = r#"
+            insert into files(process_id, file_id, file_path, export_path, status, create_ts, update_ts, retries)
+            values($1,$2,$3,$4,'NEW', now(), now(), 0)
+            on conflict (process_id, file_id) do nothing
+        "#;
+        for f in files {
+            let fake_file_path = &f.gcs_file_uri;
+            let export_path: Option<String> = None;
+            self.client
+                .execute(q, &[&process_id, &f.file_id, &fake_file_path, &export_path])
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_redispached_required_and_collect(
+        &self,
+        process_id: &str,
+        max_retries: u32,
+    ) -> Result<Vec<(String /*file_id*/, Option<String> /*file_path*/, Option<String> /*export_path*/)>> {
+        let q_select = r#"
+            select file_id, file_path, export_path
+            from files
+            where process_id = $1
+              and status in ('FAILED','TIMED_OUT')
+              and coalesce(retries, 0) < $2
+        "#;
+        let rows = self
+            .client
+            .query(q_select, &[&process_id, &(max_retries as i32)])
+            .await?;
+
+        let retry_ids: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+
+        if retry_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let q_update = r#"
+            update files
+               set status = 'REDISPATCHED',
+                   retries = coalesce(retries,0) + 1,
+                   update_ts = now()
+             where process_id = $1
+               and file_id = any($2)
+        "#;
+        self.client.execute(q_update, &[&process_id, &retry_ids]).await?;
+
+        let tasks = rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, Option<String>>(1),
+                    r.get::<_, Option<String>>(2),
+                )
+            })
+            .collect();
+
+        info!(count = retry_ids.len(), "Zaznaczono REDISPATCHED i zebrano do ponownego uruchomienia");
+        Ok(tasks)
+    }
+
+    async fn set_status(&self, process_id: &str, file_id: &str, status: Status) -> Result<()> {
+        let q = r#"
+            update files set status = $1, update_ts = now()
+            where process_id = $2 and file_id = $3
+        "#;
+        self.client
+            .execute(q, &[&status.as_str(), &process_id, &file_id])
+            .await?;
+        Ok(())
+    }
+
+    async fn status_of_all(&self, process_id: &str) -> Result<HashMap<String, Status>> {
+        let q = r#"select file_id, status from files where process_id = $1"#;
+        let rows = self.client.query(q, &[&process_id]).await?;
+        let mut m = HashMap::new();
+        for r in rows {
+            let file_id: String = r.get(0);
+            let status: String = r.get(1);
+            m.insert(file_id, Status::from_str_loose(&status));
+        }
+        Ok(m)
+    }
+
+    async fn all_completed(&self, process_id: &str, file_ids: &HashSet<String>) -> Result<bool> {
+        let statuses = self.status_of_all(process_id).await?;
+        if statuses.is_empty() {
+            return Ok(false);
+        }
+        for f in file_ids {
+            match statuses.get(f) {
+                Some(Status::Completed | Status::Finished) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn write_final_meta_and_finish(
+        &self,
+        process_id: &str,
+        export_path: &std::path::Path,
+    ) -> Result<()> {
+        // zachowana wersja – meta z basic_meta/specific_meta z tabeli `files`
+        let q = r#"
+            select file_id, basic_meta, specific_meta
+            from files
+            where process_id = $1
+        "#;
+        let rows = self.client.query(q, &[&process_id]).await?;
+        let mut meta: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for r in rows {
+            let file_id: String = r.get(0);
+            let basic: Option<serde_json::Value> = r.get(1);
+            let spec: Option<serde_json::Value> = r.get(2);
+            let mut obj = serde_json::Map::new();
+            if let Some(b) = basic {
+                obj.insert("basic_meta".into(), b);
+            }
+            if let Some(s) = spec {
+                obj.insert("specific_meta".into(), s);
+            }
+            meta.insert(file_id, serde_json::Value::Object(obj));
+        }
+        let payload = serde_json::to_vec_pretty(&meta)?;
+        tokio::fs::write(export_path, &payload)
+            .await
+            .with_context(|| format!("write {:?}", export_path))?;
+
+        // Ustaw FINISHED dla wszystkich, które są COMPLETED
+        let q2 = r#"
+            update files set status='FINISHED', update_ts = now()
+            where process_id = $1 and status in ('COMPLETED')
+        "#;
+        self.client.execute(q2, &[&process_id]).await?;
+        Ok(())
+    }
+
+    async fn listen_channel(&self, channel: &str) -> Result<()> {
+        let q = format!("LISTEN {}", channel);
+        self.client.batch_execute(&q).await?;
+        info!(%channel, "LISTEN ustawione");
+        Ok(())
+    }
+}
+
+// =====================================================================================
+// LISTENER (LISTEN/NOTIFY) – przeniesione i zachowane
+// =====================================================================================
+
+async fn create_pg_listener_stream(
+    cfg: &AppConfig,
+    sender: UnboundedSender<tokio_postgres::AsyncMessage>,
+) -> Result<()> {
+    let dsn = cfg
+        .pg_dsn
+        .clone()
+        .unwrap_or_else(|| "host=127.0.0.1 user=postgres dbname=postgres".into());
+
+    info!("Inicjuję połączenie (listener) z Postgres...");
+    let (client, mut conn) = tokio_postgres::connect(&dsn, NoTls).await?;
+
+    info!("LISTEN na kanale: {}", cfg.notify_channel);
+    client
+        .batch_execute(&format!("LISTEN {}", cfg.notify_channel))
+        .await?;
+
+    let stream = stream::poll_fn(move |cx| conn.poll_message(cx));
+    let forwarder = stream
+        .map_err(|e| {
+            error!(error=?e, "Problem z pobraniem wiadomości z Postgresa");
+            e
+        })
+        .try_for_each(move |msg| {
+            let _ = sender.send(msg);
+            futures::future::ready(Ok(()))
+        });
+
+    tokio::spawn(async move {
+        if let Err(e) = forwarder.await {
+            error!(error=?e, "Listener zakończył się błędem");
+        }
+    });
+
+    // Heartbeat
+    let validate_client = Arc::new(client);
+    let mut time_stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(30)));
+    let vc = validate_client.clone();
+    tokio::spawn(async move {
+        while time_stream.next().await.is_some() {
+            match vc.query_one("SELECT 1", &[]).await {
+                Ok(_) => debug!("Listener heartbeat OK"),
+                Err(e) => warn!(error=?e, "Listener heartbeat FAILED"),
+            }
+        }
+    });
+
+    Ok(())
+}
+
+// =====================================================================================
+// Retry bookkeeping (independent-steps)
+// =====================================================================================
+
+#[derive(Default, Debug, Clone)]
+struct RetryBook {
+    attempts: HashMap<(String, u32), u32>,
+    max_retries: u32,
+}
+impl RetryBook {
+    fn new(max_retries: u32) -> Self {
+        Self {
+            attempts: HashMap::new(),
+            max_retries,
+        }
+    }
+    fn inc_and_check(&mut self, file_id: &str, seq: u32) -> bool {
+        let key = (file_id.to_string(), seq);
+        let entry = self.attempts.entry(key).or_insert(0);
+        *entry += 1;
+        *entry <= self.max_retries
+    }
+    fn get(&self, file_id: &str, seq: u32) -> u32 {
+        *self.attempts.get(&(file_id.to_string(), seq)).unwrap_or(&0)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileProgress {
+    completed_seq: u32,
+    dispatched_seq: u32,
+}
+impl Default for FileProgress {
+    fn default() -> Self {
+        Self {
+            completed_seq: 0,
+            dispatched_seq: 0,
+        }
+    }
+}
+
+// =====================================================================================
+// Dispatcher
+// =====================================================================================
+
+struct Dispatcher {
+    cfg: AppConfig,
+    backend: Arc<dyn ProcessorBackend>,
+    db: Option<Arc<Db>>,
+    dispatcher_run_id: Uuid,
+    old_queue_messages: Arc<DashSet<String>>,
+}
+
+impl Dispatcher {
+    async fn new(cfg: AppConfig) -> Result<Self> {
+        let dispatcher_run_id = Uuid::new_v4();
+
+        let backend: Arc<dyn ProcessorBackend> = if cfg.dry_run {
+            struct DryRunBackend;
+            #[async_trait::async_trait]
+            impl ProcessorBackend for DryRunBackend {
+                async fn dispatch_job(
+                    &self,
+                    job_name: &str,
+                    json_payload: &serde_json::Value,
+                ) -> Result<String> {
+                    info!(%job_name, payload = %json_payload, "DRY-RUN dispatch");
+                    Ok(format!("dryrun-{}", job_name))
+                }
+                async fn ping(&self, job_name: &str) -> Result<()> {
+                    info!(%job_name, "DRY-RUN ping ok");
+                    Ok(())
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+            Arc::new(DryRunBackend)
+        } else {
+            let project = cfg
+                .gcp_project
+                .clone()
+                .expect("parametr --gcp-project jest wymagany poza --dry-run");
+            let region =
+                std::env::var("GCP_REGION").unwrap_or_else(|_| "europe-central2".to_string());
+            Arc::new(CloudRunBackend::new(project, region).await?)
+        };
+
+        let db = if cfg.dry_run {
+            None
+        } else {
+            Some(Arc::new(Db::connect(&cfg).await?))
+        };
+
+        Ok(Self {
+            cfg,
+            backend,
+            db,
+            dispatcher_run_id,
+            old_queue_messages: Arc::new(DashSet::new()),
+        })
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Payload
+    // ---------------------------------------------------------------------------------
+
+    async fn load_payload(cli: &Cli) -> Result<Vec<FileProcess>> {
+        if let Some(json) = &cli.payload {
+            let files: Vec<FileProcess> =
+                serde_json::from_str(json).context("Błąd parsowania --payload")?;
+            Ok(files)
+        } else if let Some(p) = &cli.payload_file {
+            let txt = tokio::fs::read_to_string(p).await?;
+            let files: Vec<FileProcess> =
+                serde_json::from_str(&txt).context("Błąd parsowania --payload-file")?;
+            Ok(files)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Listener handler
+    // ---------------------------------------------------------------------------------
+
+    async fn handle_pg_notifications(
+        &self,
+        mut receiver: UnboundedReceiver<tokio_postgres::AsyncMessage>,
+    ) {
+        let Some(db) = &self.db else {
+            warn!("Brak DB – listener nieaktywny (dry_run)");
+            return;
+        };
+        while let Some(msg) = receiver.recv().await {
+            if let tokio_postgres::AsyncMessage::Notification(n) = msg {
+                let payload = n.payload();
+                if self.old_queue_messages.contains(payload) {
+                    debug!(%payload, "Duplikat NOTIFY – pomijam");
+                    continue;
+                }
+                self.old_queue_messages.insert(payload.to_string());
+
+                debug!(channel = n.channel(), %payload, "Odebrano NOTIFY");
+
+                match serde_json::from_str::<serde_json::Value>(payload) {
+                    Ok(v) => {
+                        let file_id = v.get("file_id").and_then(|v| v.as_str());
+                        let status = v.get("status").and_then(|v| v.as_str());
+                        if let (Some(fid), Some(st)) = (file_id, status) {
+                            let st = Status::from_str_loose(st);
+                            if let Err(e) =
+                                db.set_status(&self.cfg.process_id, fid, st).await
+                            {
+                                error!(%fid, error=?e, "Nie udało się zaktualizować statusu z NOTIFY");
+                            } else {
+                                info!(%fid, status=?st.as_str(), "Zaktualizowano status z NOTIFY");
+                            }
+                        } else {
+                            warn!(%payload, "Nieprawidłowy format NOTIFY payload");
+                        }
+                    }
+                    Err(_) => warn!(%payload, "Nie udało się sparsować JSON z NOTIFY"),
+                }
+            }
+        }
+        info!("Kanał NOTIFY zakończony (brak nowych wiadomości)");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Grupowanie / sekwencyjne dispatch — per seq
+    // ---------------------------------------------------------------------------------
+
+    fn collect_sorted_seqs(files: &[FileProcess]) -> Vec<u32> {
+        let mut set = BTreeSet::new();
+        for f in files {
+            for p in &f.processes {
+                set.insert(p.exec_process_seq);
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    fn group_by_exec_object<'a>(
+        files: &'a [FileProcess],
+        seq: u32,
+    ) -> HashMap<String, Vec<&'a FileProcess>> {
+        let mut grouped: HashMap<String, Vec<&FileProcess>> = HashMap::new();
+        for f in files {
+            if f.processes.iter().any(|p| p.exec_process_seq == seq) {
+                if let Some(step) = f.processes.iter().find(|p| p.exec_process_seq == seq) {
+                    grouped
+                        .entry(step.exec_object_nm.clone())
+                        .or_default()
+                        .push(f);
+                }
+            }
+        }
+        grouped
+    }
+
+    async fn dispatch_batch_for_image(
+        &self,
+        exec_object_nm: &str,
+        items: &[&FileProcess],
+    ) -> Result<String> {
+        let batch_payload: Vec<_> = items
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "file_id": f.file_id,
+                    "gcs_file_uri": f.gcs_file_uri
+                })
+            })
+            .collect();
+
+        let json_payload = serde_json::json!({
+            "process_id": self.cfg.process_id,
+            "dispatcher_run_id": self.dispatcher_run_id.to_string(),
+            "batch": batch_payload
+        });
+
+        let exec_id = self
+            .backend
+            .dispatch_job(exec_object_nm, &json_payload)
+            .await?;
+        Ok(exec_id)
+    }
+
+    async fn dispatch_grouped_seq(&self, files: &[FileProcess], seq: u32) -> Result<()> {
+        let grouped = Self::group_by_exec_object(files, seq);
+
+        for (exec_object_nm, items) in grouped {
+            for chunk in items.chunks(self.cfg.batch_size) {
+                let exec_id = self
+                    .dispatch_batch_for_image(&exec_object_nm, chunk)
+                    .await?;
+                info!(%exec_id, %exec_object_nm, %seq, "Job uruchomiony (grupowy)");
+
+                if let Some(db) = &self.db {
+                    for f in chunk {
+                        let _ = db
+                            .set_status(&self.cfg.process_id, &f.file_id, Status::Dispatched)
+                            .await;
+                    }
+                }
+
+                if let Some(db) = &self.db {
+                    let db_clone = Arc::clone(db);
+                    let pid = self.cfg.process_id.clone();
+                    let backend = Arc::clone(&self.backend);
+                    let affected_files: Vec<String> =
+                        chunk.iter().map(|f| f.file_id.clone()).collect();
+                    let exec_id_cloned = exec_id.clone();
+
+                    tokio::spawn(async move {
+                        if let Some(cr) = ProcessorBackend::as_any(backend.as_ref())
+                            .downcast_ref::<CloudRunBackend>()
+                        {
+                            match cr
+                                .poll_until_done(
+                                    &exec_id_cloned,
+                                    Duration::from_secs(60 * 30),
+                                    Duration::from_secs(10),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    for fid in &affected_files {
+                                        let _ = db_clone
+                                            .set_status(&pid, fid, Status::Completed)
+                                            .await;
+                                    }
+                                    info!(files=?affected_files, "Execution SUCCEEDED (grupowy)");
+                                }
+                                Err(e) => {
+                                    error!(error=?e, files=?affected_files, "Execution FAILED/TIMEOUT (grupowy)");
+                                    for fid in &affected_files {
+                                        let _ = db_clone
+                                            .set_status(&pid, fid, Status::Failed)
+                                            .await;
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!("Backend nie wspiera monitorowania executions");
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_sequential_seq(&self, files: &[FileProcess], seq: u32) -> Result<()> {
+        for f in files {
+            if let Some(step) = f.processes.iter().find(|p| p.exec_process_seq == seq) {
+                let payload = serde_json::json!({
+                    "process_id": self.cfg.process_id,
+                    "dispatcher_run_id": self.dispatcher_run_id.to_string(),
+                    "file_id": f.file_id,
+                    "gcs_file_uri": f.gcs_file_uri,
+                    "process_cd": step.process_cd,
+                    "seq": step.exec_process_seq,
+                });
+                let exec_id = self
+                    .backend
+                    .dispatch_job(&step.exec_object_nm, &payload)
+                    .await?;
+                info!(%exec_id, file_id=%f.file_id, %seq, "Job uruchomiony (per-file)");
+
+                if let Some(db) = &self.db {
+                    let _ = db
+                        .set_status(&self.cfg.process_id, &f.file_id, Status::Dispatched)
+                        .await;
+                }
+
+                if let Some(db) = &self.db {
+                    let db_clone = Arc::clone(db);
+                    let pid = self.cfg.process_id.clone();
+                    let backend = Arc::clone(&self.backend);
+                    let fid = f.file_id.clone();
+                    let exec_id_cloned = exec_id.clone();
+
+                    tokio::spawn(async move {
+                        if let Some(cr) = ProcessorBackend::as_any(backend.as_ref())
+                            .downcast_ref::<CloudRunBackend>()
+                        {
+                            match cr
+                                .poll_until_done(
+                                    &exec_id_cloned,
+                                    Duration::from_secs(60 * 30),
+                                    Duration::from_secs(10),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    let _ = db_clone
+                                        .set_status(&pid, &fid, Status::Completed)
+                                        .await;
+                                    info!(%fid, "Execution SUCCEEDED (per-file)");
+                                }
+                                Err(e) => {
+                                    error!(%fid, error=?e, "Execution FAILED/TIMEOUT (per-file)");
+                                    let _ = db_clone
+                                        .set_status(&pid, &fid, Status::Failed)
+                                        .await;
+                                }
+                            }
+                        } else {
+                            warn!("Backend nie wspiera monitorowania executions");
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Orkiestracja kroków — bariera vs independent
+    // ---------------------------------------------------------------------------------
+
+    async fn run_step_with_barrier(&self, files: &[FileProcess], seq: u32) -> Result<()> {
+        if self.cfg.sequential_mode {
+            self.dispatch_sequential_seq(files, seq).await?;
+        } else {
+            self.dispatch_grouped_seq(files, seq).await?;
+        }
+
+        let targets: HashSet<String> = files
+            .iter()
+            .filter(|f| f.processes.iter().any(|p| p.exec_process_seq == seq))
+            .map(|f| f.file_id.clone())
+            .collect();
+
+        if let Some(db) = &self.db {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                match db.all_completed(&self.cfg.process_id, &targets).await {
+                    Ok(true) => {
+                        info!(%seq, "Wszystkie pliki ukończyły krok – przechodzę dalej");
+                        break;
+                    }
+                    Ok(false) => {
+                        debug!(%seq, "Czekam nadal na ukończenie kroku (bariera)...");
+                    }
+                    Err(e) => {
+                        warn!(%seq, error=?e, "Błąd sprawdzania statusów – spróbuję ponownie");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_synchronized(&self, files: &[FileProcess]) -> Result<()> {
+        let seqs = Self::collect_sorted_seqs(files);
+        for seq in seqs {
+            self.run_step_with_barrier(files, seq).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_independent(&self, files: Vec<FileProcess>) -> Result<()> {
+        let mut by_file: HashMap<String, Vec<ProcessStep>> = HashMap::new();
+        for f in &files {
+            let mut steps = f.processes.clone();
+            steps.sort_by(|a, b| a.exec_process_seq.cmp(&b.exec_process_seq));
+            by_file.insert(f.file_id.clone(), steps);
+        }
+
+        let mut progress: HashMap<String, FileProgress> = HashMap::new();
+        for f in &files {
+            progress.insert(f.file_id.clone(), FileProgress::default());
+        }
+
+        let mut retry = RetryBook::new(self.cfg.retry_max);
+
+        let start_step_for_file = |_file_id: &str,
+                                   steps: &[ProcessStep],
+                                   prog: &mut FileProgress|
+         -> Option<(u32, ProcessStep)> {
+            let next_seq = prog.completed_seq + 1;
+            if let Some(step) = steps.iter().find(|s| s.exec_process_seq == next_seq) {
+                if prog.dispatched_seq < next_seq {
+                    prog.dispatched_seq = next_seq;
+                    return Some((next_seq, step.clone()));
+                }
+            }
+            None
+        };
+
+        // Bootstrapping — uruchamiamy pierwszy krok dla każdego pliku (o ile istnieje)
+        for f in &files {
+            if let Some(prog) = progress.get_mut(&f.file_id) {
+                if let Some((seq, step)) =
+                    start_step_for_file(&f.file_id, &by_file[&f.file_id], prog)
+                {
+                    self.dispatch_single(&f.file_id, &f.gcs_file_uri, &step)
+                        .await?;
+                    let _ = seq; // information only
+                }
+            }
+        }
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            if let Some(db) = &self.db {
+                match db.status_of_all(&self.cfg.process_id).await {
+                    Ok(map) => {
+                        let mut any_progress = false;
+
+                        for f in &files {
+                            let fid = &f.file_id;
+                            let steps = &by_file[fid];
+                            if steps.is_empty() {
+                                continue;
+                            }
+                            let last_seq = steps.iter().map(|s| s.exec_process_seq).max().unwrap();
+
+                            let st = map.get(fid).copied().unwrap_or(Status::New);
+                            let prog = progress.get_mut(fid).unwrap();
+
+                            match st {
+                                Status::Completed | Status::Finished => {
+                                    if prog.completed_seq < prog.dispatched_seq {
+                                        prog.completed_seq = prog.dispatched_seq;
+                                        any_progress = true;
+
+                                        if prog.completed_seq < last_seq {
+                                            if let Some((seq, step)) = start_step_for_file(
+                                                fid, steps, prog,
+                                            ) {
+                                                self.dispatch_single(
+                                                    fid,
+                                                    &f.gcs_file_uri,
+                                                    &step,
+                                                )
+                                                .await?;
+                                                let _ = seq;
+                                            }
+                                        }
+                                    }
+                                }
+                                Status::Failed | Status::TimedOut => {
+                                    let seq = prog.dispatched_seq.max(prog.completed_seq + 1);
+                                    if retry.inc_and_check(fid, seq) {
+                                        warn!(
+                                            file_id=%fid, seq,
+                                            attempt = retry.get(fid, seq),
+                                            "Ponawiam krok po niepowodzeniu"
+                                        );
+                                        tokio::time::sleep(self.cfg.retry_backoff).await;
+                                        if let Some(step) = steps
+                                            .iter()
+                                            .find(|s| s.exec_process_seq == seq)
+                                            .cloned()
+                                        {
+                                            self.dispatch_single(fid, &f.gcs_file_uri, &step)
+                                                .await?;
+                                        }
+                                    } else {
+                                        error!(file_id=%fid, seq, "Przekroczono limit retry – zatrzymuję ten plik");
+                                    }
+                                }
+                                Status::Dispatched
+                                | Status::New
+                                | Status::Other
+                                | Status::MetaDispatched
+                                | Status::MetaExtracted
+                                | Status::Redispatched => {
+                                    // nic – czekamy na domknięcie/NOTIFY
+                                }
+                            }
+                        }
+
+                        let mut all_done = true;
+                        for f in &files {
+                            let steps = &by_file[&f.file_id];
+                            if steps.is_empty() {
+                                continue;
+                            }
+                            let last_seq = steps.iter().map(|s| s.exec_process_seq).max().unwrap();
+                            if progress[&f.file_id].completed_seq < last_seq {
+                                all_done = false;
+                                break;
+                            }
+                        }
+                        if all_done {
+                            info!("Wszystkie pliki ukończyły swoje ostatnie kroki (independent-steps) – kończę orchestrację");
+                            break;
+                        }
+
+                        if !any_progress {
+                            debug!("Brak zmian statusów w ostatniej iteracji (independent-steps)");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error=?e, "Polling statusów nieudany – spróbuję ponownie (independent-steps)");
+                    }
+                }
+            } else {
+                // dry-run – kończymy pętlę po jednej iteracji
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn dispatch_single(
+        &self,
+        file_id: &str,
+        gcs_file_uri: &str,
+        step: &ProcessStep,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "process_id": self.cfg.process_id,
+            "dispatcher_run_id": self.dispatcher_run_id.to_string(),
+            "file_id": file_id,
+            "gcs_file_uri": gcs_file_uri,
+            "process_cd": step.process_cd,
+            "seq": step.exec_process_seq,
+        });
+        let exec_id = self
+            .backend
+            .dispatch_job(&step.exec_object_nm, &payload)
+            .await?;
+        info!(%exec_id, %file_id, seq=%step.exec_process_seq, obj=%step.exec_object_nm, "Job uruchomiony (single)");
+
+        if let Some(db) = &self.db {
+            let _ = db
+                .set_status(&self.cfg.process_id, file_id, Status::Dispatched)
+                .await;
+        }
+
+        if let Some(db) = &self.db {
+            let db_clone = Arc::clone(db);
+            let pid = self.cfg.process_id.clone();
+            let backend = Arc::clone(&self.backend);
+            let fid = file_id.to_string();
+            let exec_id_cloned = exec_id.clone();
+
+            tokio::spawn(async move {
+                if let Some(cr) = ProcessorBackend::as_any(backend.as_ref())
+                    .downcast_ref::<CloudRunBackend>()
+                {
+                    match cr
+                        .poll_until_done(&exec_id_cloned, Duration::from_secs(60 * 30), Duration::from_secs(10))
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = db_clone.set_status(&pid, &fid, Status::Completed).await;
+                            info!(%fid, "Execution SUCCEEDED (single)");
+                        }
+                        Err(e) => {
+                            error!(%fid, error=?e, "Execution FAILED/TIMEOUT (single)");
+                            let _ = db_clone.set_status(&pid, &fid, Status::Failed).await;
+                        }
+                    }
+                } else {
+                    warn!("Backend nie wspiera monitorowania executions");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Ping jobs (periodic)
+    // ---------------------------------------------------------------------------------
+
+    async fn spawn_periodic_pings(&self, files: &[FileProcess]) {
+        if let Some(interval) = self.cfg.ping_interval {
+            let mut imgs = BTreeSet::new();
+            for f in files {
+                for p in &f.processes {
+                    imgs.insert(p.exec_object_nm.clone());
+                }
+            }
+            let jobs: Vec<String> = imgs.into_iter().collect();
+            if jobs.is_empty() {
+                return;
+            }
+            let backend = Arc::clone(&self.backend);
+
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    ticker.tick().await;
+                    for job in &jobs {
+                        match backend.ping(job).await {
+                            Ok(_) => debug!(%job, "Ping OK"),
+                            Err(e) => warn!(%job, error=?e, "Ping failed"),
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Fallback polling – zachowane
+    // ---------------------------------------------------------------------------------
+
+    async fn poll_statuses_periodically(&self) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => Arc::clone(db),
+            None => {
+                warn!("Brak DB – polling pominięty (dry_run)");
+                return Ok(());
+            }
+        };
+
+        let process_id = self.cfg.process_id.clone();
+        let interval = self.cfg.poll_interval;
+
+        info!(
+            secs = interval.as_secs(),
+            "Uruchamiam okresowy polling statusów (fallback)"
+        );
+
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+
+            match db.status_of_all(&process_id).await {
+                Ok(statuses) if !statuses.is_empty() => {
+                    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+                    for s in statuses.values() {
+                        *counts.entry(s.as_str()).or_insert(0usize) += 1;
+                    }
+                    debug!(?counts, "Statusy w pollingu");
+                    if let Some(dispatched) = counts.get("DISPATCHED").copied() {
+                        if dispatched > 0 {
+                            info!(dispatched, "Niektóre pliki nadal w DISPATCHED – możliwy brak NOTIFY");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    debug!("Brak rekordów dla procesu w pollingu");
+                }
+                Err(e) => {
+                    warn!(error=?e, "Polling statusów nieudany, spróbuję ponownie");
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Finalizacja meta.json – zachowana
+    // ---------------------------------------------------------------------------------
+
+    async fn finalize_when_ready(&self) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => Arc::clone(db),
+            None => {
+                warn!("Brak DB – finalizacja pominięta (dry_run)");
+                return Ok(());
+            }
+        };
+
+        let process_id = self.cfg.process_id.clone();
+        let export_path = if let Some(ref p) = self.cfg.export_dir {
+            p.clone()
+        } else {
+            std::path::PathBuf::from(format!("meta_{}.json", process_id))
+        };
+
+        let mut interval = tokio::time::interval(Duration::from_secs(90));
+        loop {
+            interval.tick().await;
+
+            match Self::all_completed(&db, &process_id).await {
+                Ok(true) => {
+                    info!("Wszystkie pliki COMPLETED – uruchamiam finalizację meta.json");
+                    if let Err(e) = db.write_final_meta_and_finish(&process_id, &export_path).await {
+                        error!(error=?e, "Finalizacja meta.json nie powiodła się");
+                    } else {
+                        info!(path=?export_path, "Finalizacja zakończona pomyślnie (FINISHED)");
+                    }
+                    break;
+                }
+                Ok(false) => {
+                    debug!("Nie wszystkie pliki ukończone – czekam dalej...");
+                }
+                Err(e) => {
+                    warn!(error=?e, "Błąd sprawdzania statusów, spróbuję ponownie");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn await_completion_and_exit(&self) -> Result<()> {
+        let db = match &self.db {
+            Some(db) => Arc::clone(db),
+            None => {
+                warn!("Brak DB – nie można monitorować zakończenia (dry_run)");
+                return Ok(());
+            }
+        };
+
+        let process_id = self.cfg.process_id.clone();
+        info!("Uruchamiam watchdog zakończenia procesu (czeka na FINISHED/FAILED/TIMED_OUT)");
+
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            interval.tick().await;
+
+            match Self::all_terminal(&db, &process_id).await {
+                Ok(true) => {
+                    info!("Wszystkie pliki osiągnęły status końcowy – kończę działanie dispatchera");
+                    std::process::exit(0);
+                }
+                Ok(false) => {
+                    debug!("Nie wszystkie pliki jeszcze zakończone – sprawdzę ponownie");
+                }
+                Err(e) => {
+                    warn!(error=?e, "Błąd podczas sprawdzania statusów – spróbuję ponownie");
+                }
+            }
+        }
+    }
+
+    async fn all_completed(db: &Db, process_id: &str) -> Result<bool> {
+        let statuses = db.status_of_all(process_id).await?;
+        if statuses.is_empty() {
+            return Ok(false);
+        }
+        let all_done = statuses.values().all(|s| *s == Status::Completed || *s == Status::Finished);
+        Ok(all_done)
+    }
+
+    async fn all_terminal(db: &Db, process_id: &str) -> Result<bool> {
+        let statuses = db.status_of_all(process_id).await?;
+        if statuses.is_empty() {
+            return Ok(false);
+        }
+        let all_done = statuses.values().all(|s| {
+            matches!(
+                s,
+                Status::Finished | Status::Failed | Status::TimedOut
+            )
+        });
+        Ok(all_done)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Run (pełny – z przywróconymi taskami tła)
+    // ---------------------------------------------------------------------------------
+
+    async fn run(&self, files: Vec<FileProcess>) -> Result<()> {
+        // DB init
+        if let Some(db) = &self.db {
+            db.init_session(self.dispatcher_run_id, &self.cfg.process_id)
+                .await?;
+            // rejestrujemy pliki
+            db.add_incoming_if_absent(&self.cfg.process_id, &files)
+                .await?;
+            // retry z DB (REDISPATCHED) – dołączamy do sesji
+            let _retry_tasks = db
+                .mark_redispached_required_and_collect(&self.cfg.process_id, self.cfg.max_retries)
+                .await?;
+            // (W tym modelu retry z DB służy głównie do requeue statusu – właściwe kroki odpalamy wg payloadu)
+        }
+
+        // Background: listener
+        if self.db.is_some() {
+            let (tx, rx) = unbounded_channel();
+            let cfg_clone = self.cfg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = create_pg_listener_stream(&cfg_clone, tx).await {
+                    error!(error=?e, "Błąd uruchamiania listenera PG");
+                }
+            });
+            let this = self.clone_light();
+            tokio::spawn(async move {
+                this.handle_pg_notifications(rx).await;
+            });
+        }
+
+        // Background: fallback polling
+        {
+            let this = self.clone_light();
+            tokio::spawn(async move {
+                if let Err(e) = this.poll_statuses_periodically().await {
+                    error!(error=?e, "Błąd w tasku pollingu");
+                }
+            });
+        }
+
+        // Background: finalize meta.json
+        {
+            let this = self.clone_light();
+            tokio::spawn(async move {
+                if let Err(e) = this.finalize_when_ready().await {
+                    error!(error=?e, "Błąd w procesie finalizacji");
+                }
+            });
+        }
+
+        // Background: pingi
+        self.spawn_periodic_pings(&files).await;
+
+        // Orchestrate
+        if self.cfg.independent_steps {
+            self.run_independent(files).await?;
+        } else {
+            self.run_synchronized(&files).await?;
+        }
+
+        // Watchdog zakończenia (zachowane)
+        {
+            let this = self.clone_light();
+            tokio::spawn(async move {
+                if let Err(e) = this.await_completion_and_exit().await {
+                    error!(error=?e, "Błąd w watchdogu zakończenia procesu");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    fn clone_light(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            backend: Arc::clone(&self.backend),
+            db: self.db.as_ref().map(Arc::clone),
+            dispatcher_run_id: self.dispatcher_run_id,
+            old_queue_messages: Arc::clone(&self.old_queue_messages),
+        }
+    }
+}
+
+// =====================================================================================
+// Tracing init
+// =====================================================================================
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,udr_dispatcher=info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false))
+        .init();
+}
+
+// =====================================================================================
+// MAIN
+// =====================================================================================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+
+    let cli = Cli::parse();
+    let cfg: AppConfig = cli.clone().into();
+
+    let files = Dispatcher::load_payload(&cli).await?;
+    if files.is_empty() {
+        warn!("Brak zadań w payloadzie – nic do zrobienia (to nie jest błąd).");
+        return Ok(());
+    }
+
+    let dispatcher = Dispatcher::new(cfg).await?;
+    if let Err(e) = dispatcher.run(files).await {
+        error!(error=?e, "Dispatcher zakończony błędem");
+        std::process::exit(1);
+    }
+    Ok(())
+}
