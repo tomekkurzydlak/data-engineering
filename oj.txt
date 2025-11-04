@@ -1,0 +1,50 @@
+pub async fn get_execution_status(&self, exec_name: &str) -> Result<ExecutionStatus> {
+    let token = self.get_token().await?;
+    let url = format!("https://run.googleapis.com/v2/{}", exec_name);
+
+    let res = self
+        .client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .context("błąd GET execution")?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let txt = res.text().await.unwrap_or_default();
+        anyhow::bail!("GET execution HTTP error {}: {}", status, txt);
+    }
+
+    let body_text = res.text().await?;
+    debug!("RAW EXEC JSON = {}", body_text);
+
+    let v: Value = serde_json::from_str(&body_text)
+        .context("Błąd parsowania execution status JSON")?;
+
+    // extract state from conditions
+    let mut mapped = "UNKNOWN".to_string();
+    if let Some(conds) = v.get("conditions").and_then(|c| c.as_array()) {
+        for c in conds {
+            if c.get("type").and_then(|x| x.as_str()) == Some("Completed") {
+                if let Some(s) = c.get("state").and_then(|x| x.as_str()) {
+                    mapped = match s {
+                        "CONDITION_SUCCEEDED" => "SUCCEEDED".to_string(),
+                        "CONDITION_FAILED" => "FAILED".to_string(),
+                        _ => "RUNNING".to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    debug!(mapped = %mapped, "Derived execution state from Cloud Run Conditions");
+
+    // serde parse to struct for other metadata fields
+    let mut status: ExecutionStatus = serde_json::from_value(v)
+        .context("Błąd mapowania execution na struct ExecutionStatus")?;
+
+    status.state = Some(mapped);
+
+    Ok(status)
+}
