@@ -1,0 +1,393 @@
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use gcp_auth::{provider, TokenProvider};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
+
+use crate::backend::ProcessorBackend;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExecutionStatus {
+    pub name: String,
+    pub uid: Option<String>,
+    pub create_time: Option<String>,
+    pub update_time: Option<String>,
+    pub state: Option<String>, // RUNNING / SUCCEEDED / FAILED / CANCELLED
+    pub task_count: Option<u32>,
+    pub succeeded_count: Option<u32>,
+    pub failed_count: Option<u32>,
+    pub cancelled_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Operation {
+    name: String,
+    done: Option<bool>,
+    error: Option<Value>,
+    metadata: Option<Value>,
+    response: Option<Value>,
+}
+
+pub struct CloudRunBackend {
+    pub project: String,
+    pub region: String,
+    client: Client,
+    token_provider: Arc<dyn TokenProvider + Send + Sync>,
+}
+
+impl CloudRunBackend {
+    pub async fn new(project: String, region: String) -> Result<Self> {
+        let provider = gcp_auth::provider().await?;
+        let client = Client::builder().build()?;
+        Ok(Self {
+            project,
+            region,
+            client,
+            token_provider: provider,
+        })
+    }
+
+    async fn get_token(&self) -> Result<String> {
+        let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
+        let token = self.token_provider.token(scopes).await?;
+        Ok(token.as_str().to_string())
+    }
+
+    fn jobs_base(&self) -> String {
+        format!(
+            "https://run.googleapis.com/v2/projects/{}/locations/{}",
+            self.project, self.region
+        )
+    }
+
+    /// ✅ PATCH /jobs/{job}?updateMask=template.template.containers.env
+    /// Ustawia zmienne środowiskowe (env vars) tak, jak `gcloud run deploy --set-env-vars`
+    pub async fn update_env_vars(
+        &self,
+        job_name: &str,
+        envs: &HashMap<String, String>,
+    ) -> Result<()> {
+        let token = self.get_token().await?;
+        let url = format!(
+            "{}/jobs/{}?updateMask=template.template.containers.env",
+            self.jobs_base(),
+            job_name
+        );
+
+        let env_json: Vec<_> = envs
+            .iter()
+            .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
+            .collect();
+
+        let body = serde_json::json!({
+            "template": {
+                "template": {
+                    "containers": [{
+                        "env": env_json
+                    }]
+                }
+            }
+        });
+
+        info!(%job_name, ?envs, "Aktualizuję zmienne środowiskowe joba...");
+        let res = self
+            .client
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("błąd PATCH joba (update env vars)")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("Update job env vars failed {}: {}", status, txt);
+        }
+
+        Ok(())
+    }
+
+    pub async fn deploy_job(
+        &self,
+        job_name: &str,
+        image: &str,
+        envs: &HashMap<String, String>,
+        secrets: &HashMap<String, String>,
+        service_account: &str,
+        sql_instance: Option<&str>,
+    ) -> Result<()> {
+        let token = self.get_token().await?;
+        let url = format!("{}/jobs?jobId={}", self.jobs_base(), job_name);
+
+        let env_json: Vec<_> = envs
+            .iter()
+            .map(|(k, v)| serde_json::json!({ "name":k, "value":v }))
+            .collect();
+
+        let secret_env_json: Vec<_> = secrets
+            .iter()
+            .map(|(k, v)| {
+                serde_json::json!({
+                    "name": k,
+                    "valuesource": {
+                        "secretKeyRef": {
+                            "secret": v,
+                            "version": "latest"
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut template = serde_json::json!({
+            "template": {
+                "template": {
+                    "vpcAccess": {
+                    "connector": "...",
+                    "egress": "ALL_TRAFFIC"
+                },
+                "serviceAccount": service_account,
+                "containers": [{
+                    "image":image,
+                    "env": env_json.into_iter().chain(secret_env_json.into_iter()).collect::<Vec<_>>()
+                }]
+            }
+        }
+
+        });
+
+        if let Some(sql) = sql_instance {
+            template["template"]["template"]["volumes"] = serde_json::json!([{
+                "name": "cloudsql",
+                "cloudSqlInstance": { "instaces": [ sql ] }
+            }]);
+        }
+
+        let res = self.client
+            .post(&url)
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .json(&template)
+            .send()
+            .await
+            .context("")?;
+
+        let status = res.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("");
+        }
+    }
+
+    /// Czeka aż operation się zakończy i zwraca execution name
+    async fn wait_for_operation(&self, operation_name: &str) -> Result<String> {
+        let token = self.get_token().await?;
+        let url = format!("https://run.googleapis.com/v2/{}", operation_name);
+
+        info!(%operation_name, "Czekam na zakończenie operation...");
+
+        for attempt in 1..=30 {
+            let res = self
+                .client
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .context("błąd GET operation")?;
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let txt = res.text().await.unwrap_or_default();
+                anyhow::bail!("GET operation HTTP error {}: {}", status, txt);
+            }
+
+            let op: Operation = res.json().await?;
+            
+            if let Some(true) = op.done {
+                // Operation zakończona
+                if let Some(err) = op.error {
+                    anyhow::bail!("Operation failed: {:?}", err);
+                }
+                
+                // Wyciągnij execution name z response
+                if let Some(response) = op.response {
+                    if let Some(exec_name) = response.get("name").and_then(|v| v.as_str()) {
+                        info!(%exec_name, "Operation zakończona, execution utworzona");
+                        return Ok(exec_name.to_string());
+                    }
+                }
+                
+                anyhow::bail!("Operation zakończona, ale brak execution name w response");
+            }
+
+            debug!(%operation_name, attempt, "Operation wciąż trwa...");
+            sleep(Duration::from_secs(2)).await;
+        }
+
+        anyhow::bail!("Operation timeout - nie zakończyła się w oczekiwanym czasie");
+    }
+
+    /// ✅ POST /jobs/{job}:run – uruchamia Cloud Run Job z payloadem
+    /// Teraz zwraca execution_name (nie operation_name!)
+    async fn start_job(&self, job_name: &str, json_payload: &Value) -> Result<String> {
+        let token = self.get_token().await?;
+        let url = format!("{}/jobs/{}:run", self.jobs_base(), job_name);
+
+        info!(%job_name, "Wywołuję Cloud Run Job...");
+        let body = serde_json::json!({
+            "overrides": {
+                "containerOverrides": [{
+                    "args": [ serde_json::to_string(json_payload)? ]
+                }]
+            }
+        });
+
+        let res = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("błąd HTTP POST /run")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("Job execution HTTP error {}: {}", status, txt);
+        }
+
+        let body: Value = res.json().await?;
+        let operation_name = body["name"]
+            .as_str()
+            .context("Brak 'name' w odpowiedzi z :run")?
+            .to_string();
+
+        info!(%operation_name, "Otrzymano operation, czekam na execution...");
+        
+        // Poczekaj aż operation się zakończy i dostaniesz execution name
+        let execution_name = self.wait_for_operation(&operation_name).await?;
+        
+        Ok(execution_name)
+    }
+
+    pub async fn get_execution_status(&self, exec_name: &str) -> Result<ExecutionStatus> {
+        let token = self.get_token().await?;
+        let url = format!("https://run.googleapis.com/v2/{}", exec_name);
+
+        let res = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("błąd GET execution")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("GET execution HTTP error {}: {}", status, txt);
+        }
+
+        let status: ExecutionStatus = res.json().await?;
+        Ok(status)
+    }
+
+    pub async fn poll_until_done(
+        &self,
+        exec_name: &str,
+        max_wait: Duration,
+        interval: Duration,
+    ) -> Result<String> {
+        let start = std::time::Instant::now();
+        sleep(Duration::from_secs(5)).await;
+
+        loop {
+            let status = self.get_execution_status(exec_name).await?;
+            let state = status.state.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+            debug!(%exec_name, %state, "Execution status poll");
+
+            match state.as_str() {
+                "SUCCEEDED" => {
+                    info!(%exec_name, "Execution SUCCEEDED");
+                    return Ok(state);
+                }
+                "FAILED" | "CANCELLED" => {
+                    error!(%exec_name, "Execution FAILED");
+                    anyhow::bail!("Execution {} failed ({})", exec_name, state)
+                }
+                "RUNNING" | "QUEUED" => {
+                    if start.elapsed() > max_wait {
+                        error!(%exec_name, "Execution TIMED OUT");
+                        anyhow::bail!("Execution {} timed out", exec_name)
+                    }
+                    sleep(interval).await;
+                }
+                _ => {
+                    warn!(%exec_name, %state, "Execution w stanie nieznanym, kontynuuję polling...");
+                    sleep(interval).await;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessorBackend for CloudRunBackend {
+    /// 🔁 Teraz pełny odpowiednik:
+    /// gcloud run deploy --set-env-vars ... && gcloud run jobs execute --wait
+    async fn dispatch_job(&self, job_name: &str, json_payload: &Value) -> Result<String> {
+        // Przykładowe env vars – możesz rozszerzyć o własne parametry
+        let mut envs = HashMap::new();
+        if let Some(pid) = json_payload.get("process_id").and_then(|v| v.as_str()) {
+            envs.insert("PROCESS_ID".to_string(), pid.to_string());
+        }
+        if let Some(drid) = json_payload.get("dispatcher_run_id").and_then(|v| v.as_str()) {
+            envs.insert("DISPATCHER_RUN_ID".to_string(), drid.to_string());
+        }
+        envs.insert("MODE".to_string(), "FULL_CLEANUP".to_string());
+
+        // 1️⃣ Zaktualizuj zmienne środowiskowe w jobie
+        self.update_env_vars(job_name, &envs).await?;
+
+        // 2️⃣ Uruchom job z payloadem - teraz zwraca execution_name
+        let exec_name = self.start_job(job_name, json_payload).await?;
+
+        // 3️⃣ Czekaj aż job się zakończy (polling)
+        let _ = self
+            .poll_until_done(&exec_name, Duration::from_secs(900), Duration::from_secs(10))
+            .await?;
+
+        Ok(exec_name)
+    }
+
+    async fn ping(&self, job_name: &str) -> Result<()> {
+        let token = self.get_token().await?;
+        let url = format!("{}/jobs/{}", self.jobs_base(), job_name);
+        let res = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("błąd GET job")?;
+
+        if res.status().is_success() {
+            info!(%job_name, "Job OK (ping)");
+            Ok(())
+        } else {
+            warn!(%job_name, status=%res.status(), "Ping nie powiódł się");
+            anyhow::bail!("Ping failed {}", res.status())
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
