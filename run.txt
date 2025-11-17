@@ -1,0 +1,82 @@
+impl Dispatcher {
+    async fn run_independent(&self, files: Vec<FileProcess>) -> Result<()> {
+        use crossbeam_channel::{unbounded, Sender, Receiver};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering}
+        };
+
+        // 1. Kolejka zadań
+        let (tx, rx): (Sender<FileTask>, Receiver<FileTask>) = unbounded();
+
+        // 2. Licznik aktywnych plików – kiedy dojdzie do 0, kończymy
+        let remaining = Arc::new(AtomicUsize::new(files.len()));
+
+        // 3. Zainicjuj pierwszy krok dla każdego pliku (z payloadu)
+        for f in &files {
+            if let Some(first_step) = f
+                .processes
+                .iter()
+                .min_by_key(|p| p.exec_process_seq)
+                .cloned()
+            {
+                let task = FileTask {
+                    file_id: f.file_id.clone(),
+                    gcs_file_uri: f.gcs_file_uri.clone(),
+                    step: first_step,
+                };
+                tx.send(task)?;
+            } else {
+                // plik bez kroków – od razu traktujemy jako zakończony
+                remaining.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        // 4. Worker pool – max self.cfg.max_workers (np. 10)
+        let max_workers = self.cfg.max_workers.max(1);
+        let mut handles = Vec::new();
+
+        let handle = tokio::runtime::Handle::current();
+        for _ in 0..max_workers {
+            let rx = rx.clone();
+            let tx_clone = tx.clone();
+            let dispatcher = self.clone_light();
+            let remaining = Arc::clone(&remaining);
+            let rt_handle = handle.clone();
+
+            let h = std::thread::spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    // Przenosimy się do świata async przez handle.block_on
+                    let result = rt_handle.block_on(async {
+                        dispatcher.process_file_task(task, &tx_clone, &remaining).await
+                    });
+
+                    if let Err(e) = result {
+                        error!(error=?e, "Błąd w workerze independent-mode");
+                    }
+                }
+            });
+            handles.push(h);
+        }
+
+        // 5. Czekamy aż wszystkie pliki się skończą
+        // (busy wait + sleep – prosto na początek)
+        loop {
+            if remaining.load(Ordering::Acquire) == 0 {
+                info!("Wszystkie pliki ukończone w independent-mode");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Zamykamy główny sender – workery dostaną Err z recv() i zakończą pętlę
+        drop(tx);
+
+        // Czekamy aż wątki się zamkną
+        for h in handles {
+            let _ = h.join();
+        }
+
+        Ok(())
+    }
+}
