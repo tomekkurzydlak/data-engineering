@@ -1,0 +1,88 @@
+impl Dispatcher {
+    async fn process_file_task(
+        &self,
+        task: FileTask,
+        tx: &crossbeam_channel::Sender<FileTask>,
+        remaining: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        let file_id = &task.file_id;
+        let gcs_file_uri = &task.gcs_file_uri;
+        let step = &task.step;
+
+        // 1. Uruchomienie kroku na Cloud Run (to samo co w sequential/grouped)
+        let payload = serde_json::json!({
+            "process_id": self.cfg.process_id,
+            "dispatcher_run_id": self.dispatcher_run_id.to_string(),
+            "file_id": file_id,
+            "gcs_file_uri": gcs_file_uri,
+            "process_cd": step.process_cd,
+            "seq": step.exec_process_seq,
+        });
+
+        let exec_id = if let Some(cr) =
+            ProcessorBackend::as_any(self.backend.as_ref())
+                .downcast_ref::<CloudRunBackend>()
+        {
+            cr.start_job(
+                &step.exec_object_nm,
+                &payload,
+                &self.cfg.env_vars, // jeśli masz env_vars w cfg
+            )
+            .await?
+        } else {
+            self.backend
+                .dispatch_job(&step.exec_object_nm, &payload)
+                .await?
+        };
+
+        info!(
+            %exec_id,
+            %file_id,
+            seq=%step.exec_process_seq,
+            obj=%step.exec_object_nm,
+            "Independent: job uruchomiony dla pliku"
+        );
+
+        if let Some(cr) =
+            ProcessorBackend::as_any(self.backend.as_ref())
+                .downcast_ref::<CloudRunBackend>()
+        {
+            cr.poll_until_done(
+                &exec_id,
+                Duration::from_secs(60 * 30),
+                Duration::from_secs(10),
+            )
+            .await?;
+        }
+
+        // 2. Pobierz kolejne kroki dla tego pliku z DB
+        if let Some(db) = &self.db {
+            let next_steps = db
+                .get_steps_for_file(file_id)
+                .await
+                .context("get_steps_for_file() failed")?;
+
+            if next_steps.is_empty() {
+                // KONIEC pliku
+                let prev = remaining.fetch_sub(1, Ordering::AcqRel);
+                info!(%file_id, prev_remaining = prev, "Independent: plik zakończony");
+            } else {
+                // Dołóż kolejne kroki do kolejki
+                for s in next_steps {
+                    let new_task = FileTask {
+                        file_id: file_id.clone(),
+                        gcs_file_uri: gcs_file_uri.clone(),
+                        step: s,
+                    };
+                    tx.send(new_task)?;
+                }
+            }
+        } else {
+            // Brak DB (np. dry-run) – traktuj jako koniec pliku
+            let prev = remaining.fetch_sub(1, Ordering::AcqRel);
+            info!(%file_id, prev_remaining = prev, "Independent: plik zakończony (no DB)");
+        }
+
+        Ok(())
+    }
+}
