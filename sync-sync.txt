@@ -1,50 +1,45 @@
-async fn run_synchronized_dynamic(
+pub async fn run_synchronized_dynamic(
     &self,
-    files: &[FileProcess],
+    files: Vec<FileProcess>,
 ) -> Result<()> {
 
-    let mut active_steps: HashMap<String, u32> = HashMap::new();
-    for f in files {
-        active_steps.insert(f.file_id.clone(), 0);
+    // Każdy plik ma swój "last_seq"
+    let mut last_seq: HashMap<String, u32> = HashMap::new();
+    for f in &files {
+        last_seq.insert(f.file_id.clone(), 0);
     }
 
     loop {
-        let mut any_step = false;
-
-        // 1) pobieramy kolejne kroki z DB
         let mut batch: Vec<(String, String, ProcessStep)> = vec![];
 
-        for f in files {
-            let last_seq = *active_steps.get(&f.file_id).unwrap();
+        // 1) Pobieramy następne kroki dla każdego pliku
+        for f in &files {
+            let file_id = &f.file_id;
+            let step_opt = self.get_steps_for_file(file_id).await?;
 
-            if let Some(step) = self.db
-                .as_ref()
-                .unwrap()
-                .get_steps_for_file(&f.file_id, last_seq)
-                .await?
-            {
+            if let Some(step) = step_opt {
                 batch.push((
                     f.file_id.clone(),
                     f.gcs_file_uri.clone(),
                     step.clone(),
                 ));
-                any_step = true;
             }
         }
 
-        // 2) jeśli nie ma żadnych kroków → koniec pipeline'u
-        if !any_step {
-            info!("DYNAMIC-SYNC: brak kolejnych kroków – koniec");
+        // 2) Jeżeli nie ma żadnych nowych kroków — KONIEC PIPELINE
+        if batch.is_empty() {
+            info!("DYNAMIC-SYNC: brak kolejnych kroków → pipeline zakończony");
             break;
         }
 
-        // 3) odpalamy WSZYSTKIE kroki dla tego poziomu seq
+        // 3) Odpalamy WSZYSTKIE kroki synchroniczne
         let mut handles = vec![];
 
         for (file_id, gcs_uri, step) in batch {
             let backend = Arc::clone(&self.backend);
             let envs = self.cfg.env_vars.clone();
 
+            // każdy krok wykonuje się jako task Tokio
             let h = tokio::spawn(async move {
                 let payload = json!({
                     "file_id": file_id,
@@ -56,8 +51,7 @@ async fn run_synchronized_dynamic(
                 let cloudrun = backend.as_any().downcast_ref::<CloudRunBackend>();
 
                 let exec_id = if let Some(cr) = cloudrun {
-                    cr.start_job(&step.exec_object_nm, &payload, &envs)
-                        .await?
+                    cr.start_job(&step.exec_object_nm, &payload, &envs).await?
                 } else {
                     backend.dispatch_job(&step.exec_object_nm, &payload).await?
                 };
@@ -76,22 +70,15 @@ async fn run_synchronized_dynamic(
             handles.push(h);
         }
 
-        // 4) Czekamy aż wszystkie joby (wszystkie pliki) zakończą się
+        // 4) czekamy aż WSZYSTKIE zakończą się
         for h in handles {
             h.await??;
         }
 
-        // 5) Aktualizujemy seq dla każdego pliku
-        for f in files {
-            let last_seq = *active_steps.get(&f.file_id).unwrap();
-
-            if let Some(_) = self.db
-                .as_ref()
-                .unwrap()
-                .get_steps_for_file(&f.file_id, last_seq)
-                .await?
-            {
-                active_steps.insert(f.file_id.clone(), last_seq + 1);
+        // 5) aktualizacja "last_seq"
+        for f in &files {
+            if let Some(s) = last_seq.get_mut(&f.file_id) {
+                *s += 1;
             }
         }
     }
