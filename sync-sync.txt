@@ -1,0 +1,100 @@
+async fn run_synchronized_dynamic(
+    &self,
+    files: &[FileProcess],
+) -> Result<()> {
+
+    let mut active_steps: HashMap<String, u32> = HashMap::new();
+    for f in files {
+        active_steps.insert(f.file_id.clone(), 0);
+    }
+
+    loop {
+        let mut any_step = false;
+
+        // 1) pobieramy kolejne kroki z DB
+        let mut batch: Vec<(String, String, ProcessStep)> = vec![];
+
+        for f in files {
+            let last_seq = *active_steps.get(&f.file_id).unwrap();
+
+            if let Some(step) = self.db
+                .as_ref()
+                .unwrap()
+                .get_steps_for_file(&f.file_id, last_seq)
+                .await?
+            {
+                batch.push((
+                    f.file_id.clone(),
+                    f.gcs_file_uri.clone(),
+                    step.clone(),
+                ));
+                any_step = true;
+            }
+        }
+
+        // 2) jeśli nie ma żadnych kroków → koniec pipeline'u
+        if !any_step {
+            info!("DYNAMIC-SYNC: brak kolejnych kroków – koniec");
+            break;
+        }
+
+        // 3) odpalamy WSZYSTKIE kroki dla tego poziomu seq
+        let mut handles = vec![];
+
+        for (file_id, gcs_uri, step) in batch {
+            let backend = Arc::clone(&self.backend);
+            let envs = self.cfg.env_vars.clone();
+
+            let h = tokio::spawn(async move {
+                let payload = json!({
+                    "file_id": file_id,
+                    "gcs_file_uri": gcs_uri,
+                    "seq": step.exec_process_seq,
+                    "process_cd": step.process_cd,
+                });
+
+                let cloudrun = backend.as_any().downcast_ref::<CloudRunBackend>();
+
+                let exec_id = if let Some(cr) = cloudrun {
+                    cr.start_job(&step.exec_object_nm, &payload, &envs)
+                        .await?
+                } else {
+                    backend.dispatch_job(&step.exec_object_nm, &payload).await?
+                };
+
+                if let Some(cr) = cloudrun {
+                    cr.poll_until_done(
+                        &exec_id,
+                        Duration::from_secs(600),
+                        Duration::from_secs(5),
+                    ).await?;
+                }
+
+                Ok::<(), anyhow::Error>(())
+            });
+
+            handles.push(h);
+        }
+
+        // 4) Czekamy aż wszystkie joby (wszystkie pliki) zakończą się
+        for h in handles {
+            h.await??;
+        }
+
+        // 5) Aktualizujemy seq dla każdego pliku
+        for f in files {
+            let last_seq = *active_steps.get(&f.file_id).unwrap();
+
+            if let Some(_) = self.db
+                .as_ref()
+                .unwrap()
+                .get_steps_for_file(&f.file_id, last_seq)
+                .await?
+            {
+                active_steps.insert(f.file_id.clone(), last_seq + 1);
+            }
+        }
+    }
+
+    Ok(())
+}
