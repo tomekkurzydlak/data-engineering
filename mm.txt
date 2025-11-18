@@ -1,0 +1,37 @@
+match (self.cfg.workflow_type, self.cfg.dispatch_mode) {
+            (WorkflowType::Static, WorkflowType::Dynamic) => {
+                unreachable!("DispatchMode nie może być WorkflowType – błąd typu")
+            }
+            (WorkflowType::Static, DispatchMode::Batch) => {
+                self.run_static_wfl_batch_jobs(&files).await?
+            }
+            (WorkflowType::Static, DispatchMode::Async) => {
+                self.run_static_wfl_async_jobs(files).await?
+            }
+            (WorkflowType::Dynamic, DispatchMode::Batch) => {
+                self.run_dynamic_wfl_batch_jobs(files).await?
+            }
+            (WorkflowType::Dynamic, DispatchMode::Async) => {
+                self.run_dynamic_wfl_async_jobs(files).await?
+            }
+        }
+
+        if let (Some(db), Some(pid)) = (&self.db, process_exec_id) {
+            let status_cd = "COMPLETED";
+            let error_msg = "";
+            let tech_update_id = self
+                .cfg
+                .tech_update_id
+                .or(self.cfg.tech_insert_id)
+                .unwrap_or(0);
+            if let Err(e) = db
+                .end_session(pid, status_cd, error_msg, tech_update_id)
+                .await
+            {
+                error!(error = ?e, "Błąd końcowego zapisu finish_process_f do DB");
+            }
+        } else {
+            warn!("Brak połączenia z DB lub brak process_exec_id – pomijam end_session");
+        }
+
+        Ok(())
