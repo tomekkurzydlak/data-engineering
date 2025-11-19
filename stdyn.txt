@@ -1,0 +1,80 @@
+async fn run_static_wfl_async_jobs(&self, files: Vec<FileProcess>) -> Result<()> {
+    let (tx, rx): (Sender<FileTask>, Receiver<FileTask>) = unbounded();
+
+    let remaining_files = Arc::new(AtomicUsize::new(files.len()));
+    let steps_cache: Arc<DashMap<String, VecDeque<ProcessStep>>> = Arc::new(DashMap::new());
+
+    // 1. Zbuduj steps_cache i wrzuć pierwszy krok dla każdego pliku
+    for f in &files {
+        if f.processes.is_empty() {
+            remaining_files.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+
+        let mut steps = f.processes.clone();
+        steps.sort_by_key(|s| s.exec_process_seq);
+
+        // pierwszy krok jako zadanie
+        let first_step = steps.remove(0);
+
+        // pozostałe kroki do cache
+        steps_cache.insert(f.file_id.clone(), steps.into());
+
+        // enqueue
+        tx.send(FileTask {
+            file_id: f.file_id.clone(),
+            gcs_file_uri: f.gcs_file_uri.clone(),
+            step: first_step,
+        })?;
+    }
+
+    drop(files);
+
+    let workers = self.cfg.max_workers;
+    let mut handles = Vec::new();
+    let rt_handle = tokio::runtime::Handle::current();
+
+    for _ in 0..workers {
+        let rx_c = rx.clone();
+        let tx_c = tx.clone();
+        let dispatcher = self.clone_light();
+        let remaining_c = Arc::clone(&remaining_files);
+        let cache_c = Arc::clone(&steps_cache);
+
+        let h = std::thread::spawn(move || {
+            while let Ok(task) = rx_c.recv() {
+                let result = rt_handle.block_on(async {
+                    dispatcher
+                        .process_static_task(
+                            task,
+                            &tx_c,
+                            &remaining_c,
+                            &cache_c,
+                        )
+                        .await
+                });
+
+                if let Err(e) = result {
+                    error!(error = ?e, "STATIC+ASYNC: błąd w workerze");
+                }
+            }
+        });
+
+        handles.push(h);
+    }
+
+    drop(tx);
+
+    for h in handles {
+        if let Err(e) = h.join() {
+            error!("STATIC+ASYNC: Worker join error: {:?}", e);
+        }
+    }
+
+    info!(
+        remaining = remaining_files.load(Ordering::Acquire),
+        "STATIC+ASYNC: workerzy zakończeni"
+    );
+
+    Ok(())
+}
