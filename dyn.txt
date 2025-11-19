@@ -1,0 +1,110 @@
+    async fn run_dynamic_wfl_batch_jobs(&self, files: Vec<FileProcess>) -> Result<()> {
+        let db = self
+            .db
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Brak połączenia z DB dla dynamicznego workflow"))?;
+
+        let fw_id = self
+            .cfg
+            .file_watcher_id
+            .ok_or_else(|| anyhow!("dynamic+batch wymaga parametru --file-watcher-id"))?;
+
+        //
+        // 1. Uruchamiamy pierwszy batch z payloadu (SEQ minimalne)
+        //
+        let mut first_steps: Vec<(String, String, ProcessStep)> = Vec::new();
+
+        for f in &files {
+            if let Some(first_step) = f.processes.iter().min_by_key(|s| s.exec_process_seq) {
+                first_steps.push((
+                    f.file_id.clone(),
+                    f.gcs_file_uri.clone(),
+                    first_step.clone(),
+                ));
+            } else {
+                warn!(
+                    file_id = %f.file_id,
+                    "DYNAMIC+BATCH: brak pierwszego kroku w payloadzie — pomijam"
+                );
+            }
+        }
+
+        if first_steps.is_empty() {
+            warn!("DYNAMIC+BATCH: brak pierwszych kroków — nic do wykonania");
+            return Ok(());
+        }
+
+        info!(
+            count = first_steps.len(),
+            "DYNAMIC+BATCH: start — batch pierwszych kroków (payload)"
+        );
+
+        self.run_batch_for_steps(&first_steps).await?;
+
+        //
+        // 2. Pobieramy *pełną listę kroków* dla wszystkich plików batcha
+        //
+        let full_map = db.get_batch_steps(fw_id).await?;
+        if full_map.is_empty() {
+            info!("DYNAMIC+BATCH: brak kolejnych kroków w DB — pipeline zakończony");
+            return Ok(());
+        }
+
+        // Zamiana mapy na:
+        // file_id -> (gcs_uri, VecDeque<ProcessStep>)
+        let mut steps_map: HashMap<String, (String, VecDeque<ProcessStep>)> = HashMap::new();
+        let mut last_seq: HashMap<String, u32> = HashMap::new();
+
+        for (file_id, (uri, steps_vec)) in full_map.into_iter() {
+            let mut dq: VecDeque<ProcessStep> = steps_vec.into();
+            steps_map.insert(file_id.clone(), (uri, dq));
+        }
+
+        // ostatni wykonany SEQ per plik — ustawiamy wg payloadu
+        for (fid, _, step) in &first_steps {
+            last_seq.insert(fid.clone(), step.exec_process_seq);
+        }
+
+        //
+        // 3. Kolejne batche — dopóki istnieją jakieś kroki
+        //
+        loop {
+            let mut batch: Vec<(String, String, ProcessStep)> = Vec::new();
+
+            for (file_id, (uri, dq)) in steps_map.iter_mut() {
+                let prev_seq = *last_seq.get(file_id).unwrap_or(&0);
+
+                if let Some(next_step) = dq.pop_front() {
+                    if next_step.exec_process_seq > prev_seq {
+                        last_seq.insert(file_id.clone(), next_step.exec_process_seq);
+                        batch.push((file_id.clone(), uri.clone(), next_step));
+                    } else {
+                        warn!(
+                            %file_id,
+                            prev_seq,
+                            next = next_step.exec_process_seq,
+                            "DYNAMIC+BATCH: krok z DB ma seq <= poprzedni — pomijam"
+                        );
+                    }
+                }
+            }
+
+            // Wyczyszczenie mapy z pustych kolejek
+            steps_map.retain(|_, (_, dq)| !dq.is_empty());
+
+            if batch.is_empty() {
+                info!("DYNAMIC+BATCH: brak kolejnych kroków — pipeline zakończony");
+                break;
+            }
+
+            info!(
+                count = batch.len(),
+                "DYNAMIC+BATCH: uruchamiam batch kolejnych kroków"
+            );
+
+            self.run_batch_for_steps(&batch).await?;
+        }
+
+        Ok(())
+    }
