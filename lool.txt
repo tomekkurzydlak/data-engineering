@@ -42,3 +42,51 @@ let h = std::thread::spawn(move || {
         }
     }
 });
+
+
+=====
+
+let h = std::thread::spawn(move || {
+    let rt = tokio::runtime::Runtime::new()
+        .expect("Tokio Runtime worker dynamic");
+
+    loop {
+        if remaining_files.load(Ordering::Acquire) == 0 {
+            break;
+        }
+
+        match rx_tasks_clone.recv_timeout(Duration::from_secs(1)) {
+            Ok(task) => {
+                let dispatcher_c = dispatcher.clone_light();
+                let db_for_call = db_clone.clone();
+
+                let res = rt.block_on(async {
+                    dispatcher_c
+                        .process_dynamic_task(
+                            task,
+                            &tx_tasks_clone,
+                            &remaining_files,
+                            &steps_cache,
+                            &db_for_call,
+                            &tx_exec_clone,
+                        )
+                        .await
+                });
+
+                if res.is_err() {
+                    remaining_files.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // sprawdzimy remaining_files na górze pętli
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+});
+
+
+
