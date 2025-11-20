@@ -639,3 +639,46 @@
 
 ====
 
+final chng
+
+
+
+// --- NOWE: dopiero po zakończeniu joba pobieramy kolejne kroki z DB ---
+
+if let Some((file_id, gcs_uri, last_seq)) =
+    EXEC_MAP.remove(&exec_id).map(|e| e.1)
+{
+    // pobierz wszystkie kroki
+    match db.get_steps_for_file(&file_id).await {
+        Ok(all_steps) => {
+            // wybierz pierwszy krok o seq > last_seq
+            let next_opt = all_steps
+                .into_iter()
+                .filter(|s| s.exec_process_seq > last_seq)
+                .min_by_key(|s| s.exec_process_seq);
+
+            if let Some(next_step) = next_opt {
+                let next_task = FileTask {
+                    file_id: file_id.clone(),
+                    gcs_file_uri: gcs_uri.clone(),
+                    step: next_step,
+                };
+
+                if let Err(e) = tx_tasks.send(next_task) {
+                    error!(?e, %file_id, "poller: nie udało się enqueue next step");
+                    error_flag_for_poller.store(true, Ordering::SeqCst);
+                }
+            } else {
+                // koniec pliku
+                let prev = remaining_files.fetch_sub(1, Ordering::AcqRel);
+                info!(%file_id, prev_remaining=%prev, "poller: brak dalszych kroków — koniec pliku");
+            }
+        }
+        Err(e) => {
+            error!(?e, %file_id, "poller: błąd get_steps_for_file");
+            remaining_files.fetch_sub(1, Ordering::AcqRel);
+            error_flag_for_poller.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
