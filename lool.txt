@@ -1,0 +1,44 @@
+let h = std::thread::spawn(move || {
+    let rt = tokio::runtime::Runtime::new()
+        .expect("Tokio Runtime worker error");
+
+    loop {
+        // jeśli już nie ma żadnych plików do obsługi – kończymy worker
+        if remaining_files.load(Ordering::Acquire) == 0 {
+            break;
+        }
+
+        match rx_tasks_clone.recv_timeout(Duration::from_secs(1)) {
+            Ok(task) => {
+                let dispatcher_c = dispatcher.clone_light();
+
+                let res = rt.block_on(async {
+                    dispatcher_c
+                        .process_static_task(
+                            task,
+                            &tx_tasks_clone,
+                            &remaining_files,
+                            &steps_cache,
+                            &tx_exec_clone,
+                        )
+                        .await
+                });
+
+                if let Err(e) = res {
+                    error!(error = ?e, "STATIC+ASYNC worker error");
+                    // to już masz – ale zostawiamy to tu jawnie:
+                    remaining_files.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // po prostu odpalamy kolejną iterację,
+                // ale jeśli remaining_files == 0, wyjdziemy na początku pętli
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // kanał zamknięty – nie będzie więcej tasków
+                break;
+            }
+        }
+    }
+});
