@@ -1,0 +1,114 @@
+async fn process_static_task(
+    &self,
+    task: FileTask,
+    tx_tasks: &Sender<FileTask>,
+    remaining_files: &Arc<AtomicUsize>,
+    steps_cache: &Arc<DashMap<String, VecDeque<ProcessStep>>>,
+    tx_exec: &Sender<String>,
+    error_flag: &Arc<AtomicBool>,
+) -> Result<()> {
+    let file_id = &task.file_id;
+    let gcs_file_uri = &task.gcs_file_uri;
+    let step = &task.step;
+
+    // ENV
+    let mut envs = self.cfg.env_vars.clone();
+    let tgt_path = step
+        .params
+        .get("trg_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    envs.insert("TGT_PATH".into(), tgt_path.to_string());
+
+    let payload = serde_json::json!({
+        "process_id": self.cfg.process_id,
+        "dispatcher_run_id": self.dispatcher_run_id.to_string(),
+        "file_id": file_id,
+        "gcs_file_uri": gcs_file_uri,
+        "process_cd": step.process_cd,
+        "seq": step.exec_process_seq,
+    });
+
+    let job_name = &step.exec_object_nm;
+
+    // 1. start_job
+    let exec_id = match self.backend.as_any().downcast_ref::<CloudRunBackend>() {
+        Some(cr) => {
+            match cr.start_job(job_name, &payload, &envs).await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(error=?e, %file_id, "STATIC+ASYNC: błąd start_job");
+                    error_flag.store(true, Ordering::SeqCst);
+                    remaining_files.fetch_sub(1, Ordering::AcqRel);
+                    return Err(e);
+                }
+            }
+        }
+        None => {
+            match self.backend.dispatch_job(job_name, &payload).await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(error=?e, %file_id, "STATIC+ASYNC: błąd dispatch_job");
+                    error_flag.store(true, Ordering::SeqCst);
+                    remaining_files.fetch_sub(1, Ordering::AcqRel);
+                    return Err(e);
+                }
+            }
+        }
+    };
+
+    info!(
+        %exec_id,
+        %file_id,
+        seq = step.exec_process_seq,
+        obj = %step.exec_object_nm,
+        "STATIC+ASYNC: job uruchomiony"
+    );
+
+    // 2. WYSYŁAMY DO POLLERA (opcjonalnie – jeśli chcesz)
+    let _ = tx_exec.send(exec_id.clone());
+
+    // 3. CZEKAJ AŻ JOB SIĘ ZAKOŃCZY — KLUCZOWE!
+    if let Some(cr) = self.backend.as_any().downcast_ref::<CloudRunBackend>() {
+        if let Err(e) = cr
+            .poll_until_done(
+                &exec_id,
+                Duration::from_secs(1800),
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            error!(error=?e, %file_id, "STATIC+ASYNC: błąd poll_until_done");
+            error_flag.store(true, Ordering::SeqCst);
+            remaining_files.fetch_sub(1, Ordering::AcqRel);
+            return Err(e);
+        }
+    }
+
+    // 4. Teraz dopiero pobieramy kolejny krok
+    if let Some(mut entry) = steps_cache.get_mut(file_id) {
+        if let Some(next_step) = entry.pop_front() {
+            let queue_empty = entry.is_empty();
+            drop(entry);
+            if queue_empty {
+                steps_cache.remove(file_id);
+            }
+
+            let next_task = FileTask {
+                file_id: file_id.clone(),
+                gcs_file_uri: gcs_file_uri.clone(),
+                step: next_step,
+            };
+
+            tx_tasks.send(next_task)?;
+            return Ok(());
+        } else {
+            drop(entry);
+            steps_cache.remove(file_id);
+        }
+    }
+
+    // 5. Jeśli nie było kolejnego kroku → KONIEC PLIKU
+    remaining_files.fetch_sub(1, Ordering::AcqRel);
+    Ok(())
+}
