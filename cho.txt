@@ -1,0 +1,113 @@
+/// Pomocnicze: natychmiastowe zakończenie kroku błędem w DB
+async fn fail_step_session(
+    &self,
+    process_cd: &str,
+    error_msg: &str,
+) -> Result<()> {
+    let Some(db) = &self.db else {
+        // brak DB → nic nie robimy, ale sygnalizujemy błąd w logu
+        error!(
+            %process_cd,
+            %error_msg,
+            "fail_step_session: brak DB, nie mogę zapisać błędu kroku"
+        );
+        return Ok(());
+    };
+
+    let file_watcher_id = self.cfg.file_watcher_id.unwrap_or(0);
+    let tech_insert_id = self.cfg.tech_insert_id.unwrap_or(0);
+
+    // start_process_f
+    let pid = db
+        .init_session(process_cd, file_watcher_id, tech_insert_id)
+        .await
+        .context("fail_step_session: błąd wywołania start_process_f")?;
+
+    let tech_update_id = self
+        .cfg
+        .tech_update_id
+        .or(self.cfg.tech_insert_id)
+        .unwrap_or(0);
+
+    // finish_process_f
+    if let Err(e) = db
+        .end_session(pid, "ERROR", error_msg, tech_update_id)
+        .await
+    {
+        error!(
+            error=?e,
+            %pid,
+            %process_cd,
+            "fail_step_session: błąd wywołania finish_process_f"
+        );
+    }
+
+    Ok(())
+}
+
+
+======
+
+
+
+      async fn get_steps_for_file(&self, file_id: &str) -> Result<Vec<ProcessStep>> {
+    let q = r#"select mda_14_proc_unstruct.get_payload_for_dispatcher_file($1)"#;
+
+    let row = self
+        .client
+        .query_one(q, &[&file_id])
+        .await
+        .with_context(|| format!("Błąd wykonania get_payload_for_dispatcher_file({file_id})"))?;
+
+    // --- 1. Pobranie TEXT/NULL ---
+    let payload_opt: Option<String> = row.get(0);
+
+    let payload_str = match payload_opt {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            let msg = format!("DB zwróciła NULL lub pusty JSON dla file_id={file_id}");
+            self.fail_step_session("UNKNOWN", &msg).await?;
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+
+    // --- 2. Parsowanie JSON ---
+    let json: JsonValue = match serde_json::from_str(&payload_str) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("Nie mogę sparsować JSON dla file_id={file_id}: {e}");
+            self.fail_step_session("UNKNOWN", &msg).await?;
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+
+    // --- 3. Wydobycie sekcji "processes" ---
+    let processes_val = match json.get("processes") {
+        Some(v) => v.clone(),
+        None => {
+            let msg = format!("Brak pola 'processes' w JSON dla file_id={file_id}");
+            self.fail_step_session("UNKNOWN", &msg).await?;
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+
+    // --- 4. Deserializacja ---
+    let mut steps: Vec<ProcessStep> = match serde_json::from_value(processes_val) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("Błąd parsowania steps z JSON dla file_id={file_id}: {e}");
+            self.fail_step_session("UNKNOWN", &msg).await?;
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+
+    if steps.is_empty() {
+        let msg = format!("DB zwróciła puste 'processes' dla file_id={file_id}");
+        self.fail_step_session("UNKNOWN", &msg).await?;
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    steps.sort_by_key(|s| s.exec_process_seq);
+
+    Ok(steps)
+}
