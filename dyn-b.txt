@@ -1,0 +1,92 @@
+/// Pobiera pełen payload batcha.
+/// Oczekiwany format z DB:
+/// [ { "files": [ {...}, {...} ] } ]
+///
+/// Funkcja jest odporna na:
+/// - NULL
+/// - pusty JSON
+/// - niepoprawny format
+/// - tablice typu [ {} ]
+/// - brak pola "files"
+async fn get_batch_steps(
+    &self,
+    file_watcher_id: i64,
+) -> Result<HashMap<String, (String, Vec<ProcessStep>)>> {
+
+    let q = r#"select mda_14_proc_unstruct.get_payload_for_dispatcher_batch($1)"#;
+
+    let row = self
+        .client
+        .query_one(q, &[&file_watcher_id])
+        .await
+        .with_context(|| {
+            format!(
+                "DB_FETCH_ERROR: błąd wykonania get_payload_for_dispatcher_batch({file_watcher_id})"
+            )
+        })?;
+
+    // 1. Odbieramy jako serde_json::Value
+    let json: JsonValue = row.get(0);
+
+    // 2. NULL → brak batcha
+    if json.is_null() {
+        warn!("get_batch_steps: DB zwróciła NULL — traktuję jako brak kroków");
+        return Ok(HashMap::new());
+    }
+
+    // 3. Funkcja zwraca w formie: [ { "files": [...] } ]
+    let obj = json
+        .as_array()
+        .and_then(|arr| arr.get(0))
+        .cloned()
+        .unwrap_or(JsonValue::Object(Default::default()));
+
+    // 4. Wyciągamy pole "files"
+    let files_val = obj
+        .get("files")
+        .cloned()
+        .unwrap_or(JsonValue::Array(Vec::new()));
+
+    // 5. "files": []
+    if files_val
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(true)
+    {
+        warn!("get_batch_steps: 'files' jest puste — brak kroków");
+        return Ok(HashMap::new());
+    }
+
+    // 6. Parse listy FileProcess
+    let entries: Vec<FileProcess> = serde_json::from_value(files_val).map_err(|e| {
+        anyhow::anyhow!(
+            "JSON_PARSE_ERROR: błąd parsowania listy files z get_batch_steps: {e}"
+        )
+    })?;
+
+    if entries.is_empty() {
+        warn!("get_batch_steps: entries puste po parsowaniu");
+        return Ok(HashMap::new());
+    }
+
+    // 7. Budujemy mapę wynikową
+    let mut map: HashMap<String, (String, Vec<ProcessStep>)> = HashMap::new();
+
+    for e in entries {
+        let mut steps = e.processes;
+
+        // Jeśli brak steps → pomijamy ten plik
+        if steps.is_empty() {
+            warn!(
+                file_id = %e.file_id,
+                "get_batch_steps: plik nie ma żadnych process steps — pomijam"
+            );
+            continue;
+        }
+
+        steps.sort_by_key(|s| s.exec_process_seq);
+        map.insert(e.file_id, (e.gcs_file_uri, steps));
+    }
+
+    Ok(map)
+}
