@@ -1,0 +1,264 @@
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+use clap::Parser;
+use serde::Serialize;
+use serde_json::json;
+use std::{fs, path::{Path, PathBuf}};
+use tokio_postgres::{Client, NoTls};
+use tracing::{error, info};
+use urlencoding::encode;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "MD preprocess - metadata extractor")]
+struct Args {
+
+    /// Ścieżki do plików MD, oddzielone przecinkami
+    #[arg(long, env)]
+    pub inputs: String,
+
+    /// Mount bucketu GCS / folder docelowy
+    #[arg(long, env, default_value = "./out")]
+    pub bucket_out: PathBuf,
+
+    /// PG URL (bez user/pass)
+    #[arg(long, env)]
+    pub pg_url: String,
+
+    #[arg(long, env)]
+    pub db_user: String,
+
+    #[arg(long, env)]
+    pub db_pass: String,
+
+    #[arg(long, env)]
+    pub db_name: String,
+
+    /// Orchestrator process id (dispatcher)
+    #[arg(long, env)]
+    pub process_id: i64,
+
+    /// File id w orchestratorze
+    #[arg(long, env)]
+    pub file_id: i64,
+
+    /// Tech insert id - przy add_file
+    #[arg(long, env)]
+    pub tech_insert_id: i64,
+
+    /// Tech update id - do update_file_meta
+    #[arg(long, env)]
+    pub tech_update_id: i64,
+
+}
+
+#[derive(Serialize)]
+struct FileMeta {
+    word_count: usize,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    fs::create_dir_all(&args.bucket_out)?;
+
+    // ---- PG CONNECT ----
+    let client = connect_pg(&args).await?;
+
+    let files: Vec<&str> = args.inputs
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for input_path in files {
+
+        match process_file(&args, &client, input_path).await {
+
+            Ok(_) => {
+
+                call_update_status(
+                    &client,
+                    &args,
+                    "COMPLETED",
+                    None,
+                ).await?;
+
+                info!("Processed OK: {input_path}");
+            }
+
+            Err(err) => {
+
+                error!("Processing FAILED {input_path}: {err:?}");
+
+                call_update_status(
+                    &client,
+                    &args,
+                    "ERROR",
+                    Some(err.to_string())
+                ).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_file(
+    args: &Args,
+    client: &Client,
+    input_path: &str,
+) -> Result<()> {
+
+    let path = Path::new(input_path);
+    let content = fs::read_to_string(path)?;
+
+    let word_count = content.split_whitespace().count();
+
+    // --- zapis MD do bucketu ---
+    let file_name = sanitize_filename(
+        path.file_name()
+            .ok_or(anyhow!("Invalid filename"))?
+            .to_string_lossy()
+            .as_ref(),
+    );
+
+    let dst_path = args.bucket_out.join(format!("{file_name}.md"));
+
+    fs::write(&dst_path, content)?;
+
+    let gcs_uri = dst_path
+        .canonicalize()?
+        .to_string_lossy()
+        .to_string();
+
+    // --- add_file_f ---
+    call_add_file(
+        client,
+        &gcs_uri,
+        args.tech_insert_id
+    ).await?;
+
+    // --- build metadata json ---
+    let meta = FileMeta { word_count };
+
+    let meta_json = json!(meta);
+
+    // --- update_file_meta_f ---
+    call_update_file_meta(
+        client,
+        args.file_id,
+        meta_json.to_string(),
+        args.tech_update_id
+    ).await?;
+
+    Ok(())
+}
+
+fn sanitize_filename(name: &str) -> String {
+
+    name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(name)
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+async fn connect_pg(args: &Args) -> Result<Client> {
+
+    let encoded_pass = encode(&args.db_pass);
+
+    let url = format!(
+        "postgresql://{}:{}@{}/{}",
+        args.db_user,
+        encoded_pass,
+        args.pg_url,
+        args.db_name
+    );
+
+    let (client, conn) = tokio_postgres::connect(&url, NoTls).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            error!("PG connection error: {}", e);
+        }
+    });
+
+    info!("Connected to PostgreSQL");
+
+    Ok(client)
+}
+
+// ------------------------------------------------------------
+// DB FUNCTIONS - JEDYNY KONTAKT Z BAZĄ
+// ------------------------------------------------------------
+
+async fn call_add_file(
+    client: &Client,
+    gcs_uri: &str,
+    tech_insert_id: i64,
+) -> Result<()> {
+
+    let q = r#"
+        select db_name_tb.add_file_f($1,$2,NULL)
+    "#;
+
+    client
+        .query_one(q, &[&gcs_uri, &tech_insert_id])
+        .await?;
+
+    Ok(())
+}
+
+async fn call_update_file_meta(
+    client: &Client,
+    file_id: i64,
+    meta_json: String,
+    tech_update_id: i64,
+) -> Result<()> {
+
+    let q = r#"
+        select db_name_tb.update_file_meta_f($1,$2,$3)
+    "#;
+
+    client
+        .query_one(q, &[&file_id, &meta_json, &tech_update_id])
+        .await?;
+
+    Ok(())
+}
+
+async fn call_update_status(
+    client: &Client,
+    args: &Args,
+    status_cd: &str,
+    error_msg: Option<String>,
+) -> Result<()> {
+
+    let q = r#"
+        select db_name_tb.update_file_status_f($1,$2,$3,$4,$5,$6)
+    "#;
+
+    client
+        .query_one(q, &[
+            &args.file_id,
+            &args.process_id,
+            &status_cd,
+            &None::<String>,
+            &error_msg,
+            &args.tech_update_id,
+        ])
+        .await?;
+
+    Ok(())
+}
