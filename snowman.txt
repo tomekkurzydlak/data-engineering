@@ -1,33 +1,62 @@
-import sys, time, random, shutil
+import sys
+import shutil
+import random
 from termcolor import colored
 
-LIGHTS = ["green", "yellow", "cyan", "magenta"]
+STAR_CHARS = ["❄", "✦", "✧"]   # dekoracje
 
-def safe_glow():
+def static_tree_scene():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    WIDTH = shutil.get_terminal_size((130,40)).columns
-    PAD = (WIDTH - 60) // 2
+    WIDTH = shutil.get_terminal_size((130, 40)).columns
 
-    scene = [
-        "           *                ⛄",
-        "          /***\\            (   )",
-        "         /*******\\             ||",
+    # --- BIG TREE ---
+    tree = [
+        "           *",
+        "          /***\\",
+        "         /*******\\",
         "        /***********\\",
         "       /***************\\",
         "      /*******************\\",
         "     /***********************\\",
         "    /***************************\\",
         "   /********************************\\",
-        "                |||"
+        "                |||",
     ]
 
-    for line in scene:
-        color = random.choice(LIGHTS)
-        print(colored(" " * PAD + line, color))
-        time.sleep(0.08)
+    SCENE_WIDTH = 65
+    LEFT_PAD = max(0, (WIDTH - SCENE_WIDTH) // 2)
 
+    def decorate(line):
+        out = ""
+
+        for ch in line:
+            if ch == "*":
+                # Zamiana części '*' na białe gwiazdki – NIEREGULARNIE
+                if random.random() < 0.18:
+                    out += colored(random.choice(STAR_CHARS), "white", attrs=["bold"])
+                else:
+                    out += colored(ch, "green")
+            elif ch in "/\\":
+                out += colored(ch, "green", attrs=["bold"])
+            elif ch == "|":
+                out += colored(ch, "yellow")
+            else:
+                out += colored(ch, "green") if ch != " " else " "
+
+        return out
+
+    print()
+
+    for t in tree:
+        composed = " " * LEFT_PAD + t
+        print(decorate(composed))
+
+    print()
+
+
+# ------------------------------
 
 if __name__ == "__main__":
-    safe_glow()
+    static_tree_scene()
