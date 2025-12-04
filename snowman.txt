@@ -1,0 +1,94 @@
+import sys
+import time
+import shutil
+import random
+from termcolor import colored
+
+# ----------------------------------
+
+LIGHT_COLORS = ["yellow", "cyan", "magenta"]
+DIM_COLORS   = ["green"]
+GLOW_STEPS   = 20
+
+
+def glowing_scene(frames=14, delay=0.18):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    WIDTH = shutil.get_terminal_size((80, 20)).columns
+
+    tree = [
+        "      *",
+        "     /*****\\",
+        "    /*********\\",
+        "   /*************\\",
+        "  /*****************\\",
+        "       |||"
+    ]
+
+    snowman = [
+        "        ⛄",
+        "       (   )",
+        "      (     )",
+        "         ||"
+    ]
+
+    H = max(len(tree), len(snowman))
+    tree += [""] * (H - len(tree))
+    snowman += [""] * (H - len(snowman))
+
+    SCENE_WIDTH = 42
+    LEFT_PAD = max(0, (WIDTH - SCENE_WIDTH) // 2)
+
+    glow = 0
+
+    for frame in range(frames):
+
+        print("\033[2J\033[H", end="")
+
+        glow = (glow + 1) % GLOW_STEPS
+        intensity = abs(glow - GLOW_STEPS // 2)
+
+        # im bliżej środka fali, tym jaśniejsze światła
+        light_color = (
+            random.choice(LIGHT_COLORS)
+            if intensity < (GLOW_STEPS // 3)
+            else random.choice(DIM_COLORS)
+        )
+
+        for t, s in zip(tree, snowman):
+
+            line = " " * LEFT_PAD + t.ljust(22) + "   " + s
+
+            out = []
+
+            for ch in line:
+
+                if ch == "*":
+                    out.append(colored("●", light_color))
+
+                elif ch in "/\\":
+                    out.append(colored(ch, "green", attrs=["bold"]))
+
+                elif ch == "|":
+                    out.append(colored(ch, "yellow"))
+
+                elif ch == "⛄":
+                    out.append(colored(ch, "white", attrs=["bold"]))
+
+                else:
+                    out.append(colored(ch, "green") if ch != " " else " ")
+
+            print("".join(out))
+
+        time.sleep(delay)
+
+    print()
+
+
+# ----------------------------------
+
+if __name__ == "__main__":
+
+    if sys.stdout.isatty():
+        glowing_scene()
