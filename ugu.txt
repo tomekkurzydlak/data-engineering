@@ -1,0 +1,164 @@
+async fn process_dynamic_task(
+    &self,
+    task: FileTask,
+    tx_tasks: &Sender<FileTask>,
+    remaining_files: &Arc<AtomicUsize>,
+    steps_cache: &Arc<DashMap<String, VecDeque<ProcessStep>>>,
+    db: &Arc<Db>,
+    error_flag: &Arc<AtomicBool>,
+) -> Result<()> {
+    let file_id = &task.file_id;
+    let gcs_file_uri = &task.gcs_file_uri;
+    let step = &task.step;
+
+    // 1) wykonaj krok
+    if let Err(e) = self
+        .execute_step_with_session(file_id, gcs_file_uri, step)
+        .await
+    {
+        error!(
+            error=?e,
+            %file_id,
+            seq = step.exec_process_seq,
+            "DYNAMIC+ASYNC: błąd wykonania kroku"
+        );
+        error_flag.store(true, Ordering::SeqCst);
+        remaining_files.fetch_sub(1, Ordering::AcqRel);
+        return Err(e);
+    }
+
+    // 2) jeśli brak entry w cache -> pobierz z DB Z RETRY, ale SOFT-FAIL po wyczerpaniu
+    if !steps_cache.contains_key(file_id) {
+        const BACKOFFS_MS: &[u64] = &[100, 500, 1_000, 3_000, 5_000];
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut steps_opt: Option<Vec<ProcessStep>> = None;
+
+        for (attempt, delay_ms) in BACKOFFS_MS.iter().enumerate() {
+            match db.get_steps_for_file(file_id).await {
+                Ok(s) => {
+                    if s.is_empty() {
+                        last_err = Some(anyhow::anyhow!(
+                            "{}: get_steps_for_file returned empty vec",
+                            StepErrorCode::EmptyProcesses.as_str()
+                        ));
+                    } else {
+                        steps_opt = Some(s);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // retry tylko dla "payload not ready"
+                    let msg = e.to_string();
+                    let retryable =
+                        msg.contains(StepErrorCode::NullJson.as_str())
+                            || msg.contains(StepErrorCode::EmptyProcesses.as_str())
+                            || msg.contains(StepErrorCode::MissingProcesses.as_str())
+                            || msg.contains("brak zdefiniowanych procesów");
+
+                    if !retryable {
+                        // hard fail (to jest realny błąd DB/JSON)
+                        let code = if msg.contains("NULL_JSON") {
+                            StepErrorCode::NullJson
+                        } else if msg.contains("JSON_PARSE_ERROR") {
+                            StepErrorCode::JsonParse
+                        } else if msg.contains("MISSING_PROCESSES") {
+                            StepErrorCode::MissingProcesses
+                        } else if msg.contains("EMPTY_PROCESSES") {
+                            StepErrorCode::EmptyProcesses
+                        } else {
+                            StepErrorCode::DbFetchError
+                        };
+                        let _ = self.fail_step_session("UNKNOWN", file_id, code, &msg).await;
+
+                        error!(error=?e, %file_id, "DYNAMIC+ASYNC: błąd get_steps_for_file (hard)");
+                        error_flag.store(true, Ordering::SeqCst);
+                        remaining_files.fetch_sub(1, Ordering::AcqRel);
+                        return Err(e);
+                    }
+
+                    last_err = Some(e);
+                }
+            }
+
+            if attempt + 1 < BACKOFFS_MS.len() {
+                debug!(
+                    %file_id,
+                    attempt = attempt + 1,
+                    sleep_ms = *delay_ms,
+                    "DYNAMIC+ASYNC: payload not ready yet — retry"
+                );
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+        }
+
+        // po retry: jeśli nadal brak steps -> SOFT FAIL (nie wywalaj całego runa)
+        let steps = match steps_opt {
+            Some(s) => s,
+            None => {
+                let msg = last_err
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "<none>".to_string());
+
+                let code = if msg.contains("NULL_JSON") {
+                    StepErrorCode::NullJson
+                } else if msg.contains("JSON_PARSE_ERROR") {
+                    StepErrorCode::JsonParse
+                } else if msg.contains("MISSING_PROCESSES") {
+                    StepErrorCode::MissingProcesses
+                } else if msg.contains("EMPTY_PROCESSES") {
+                    StepErrorCode::EmptyProcesses
+                } else {
+                    StepErrorCode::DbFetchError
+                };
+
+                let _ = self.fail_step_session("UNKNOWN", file_id, code, &msg).await;
+
+                error!(
+                    %file_id,
+                    code = code.as_str(),
+                    last_error = %msg,
+                    "DYNAMIC+ASYNC: payload nadal niegotowy po retry -> SOFT FAIL pliku"
+                );
+
+                error_flag.store(true, Ordering::SeqCst);
+                steps_cache.remove(file_id);
+                remaining_files.fetch_sub(1, Ordering::AcqRel);
+                return Ok(());
+            }
+        };
+
+        let mut sorted = steps;
+        sorted.sort_by_key(|s| s.exec_process_seq);
+        steps_cache.insert(file_id.clone(), sorted.into());
+    }
+
+    // 3) enqueue next step
+    if let Some(mut entry) = steps_cache.get_mut(file_id) {
+        if let Some(next_step) = entry.pop_front() {
+            drop(entry);
+
+            let next_task = FileTask {
+                file_id: file_id.clone(),
+                gcs_file_uri: gcs_file_uri.clone(),
+                step: next_step,
+            };
+
+            if let Err(e) = tx_tasks.send(next_task) {
+                error!(error=?e, %file_id, "DYNAMIC+ASYNC: błąd wysłania kolejnego kroku");
+                error_flag.store(true, Ordering::SeqCst);
+                remaining_files.fetch_sub(1, Ordering::AcqRel);
+                return Err(anyhow::anyhow!("Kanał workerów zamknięty"));
+            }
+            return Ok(());
+        }
+        drop(entry);
+    }
+
+    // 4) koniec pliku
+    steps_cache.remove(file_id);
+    remaining_files.fetch_sub(1, Ordering::AcqRel);
+    Ok(())
+}
+====
