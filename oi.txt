@@ -1,0 +1,369 @@
+use quick_xml::events::Event;
+use quick_xml::Reader;
+
+#[derive(Debug, Clone)]
+struct WordBox {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct LineBox {
+    y_min: f32,
+    y_max: f32,
+    x_min: f32,
+    x_max: f32,
+    words: Vec<WordBox>,
+    // sygnał “nowy blok” -> nowy akapit
+    block_break_before: bool,
+}
+
+fn parse_f32_attr(val: &str) -> Option<f32> {
+    val.parse::<f32>().ok()
+}
+
+fn line_to_text(line: &LineBox) -> String {
+    line.words
+        .iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+/// Parser dla `pdftotext -bbox-layout`:
+/// - buduje linie na podstawie tagu <line>
+/// - słowa bierze z <word>
+/// - granice <block> mapuje na akapity
+fn parse_bbox_layout_lines(xhtml: &str) -> Result<Vec<LineBox>> {
+    let mut reader = Reader::from_str(xhtml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+
+    let mut in_word = false;
+    let mut in_line = false;
+
+    // blok/akapity
+    let mut pending_block_break = false;
+
+    // bieżący word
+    let mut w_xmin: Option<f32> = None;
+    let mut w_ymin: Option<f32> = None;
+    let mut w_xmax: Option<f32> = None;
+    let mut w_ymax: Option<f32> = None;
+    let mut word_text = String::new();
+
+    // bieżąca linia
+    let mut line_ymin: Option<f32> = None;
+    let mut line_ymax: Option<f32> = None;
+    let mut line_words: Vec<WordBox> = Vec::new();
+
+    let mut out: Vec<LineBox> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                match e.name().as_ref() {
+                    b"block" => {
+                        // kolejna linia po <block> zacznie nowy akapit
+                        pending_block_break = true;
+                    }
+                    b"line" => {
+                        in_line = true;
+                        line_words.clear();
+                        line_ymin = None;
+                        line_ymax = None;
+
+                        for a in e.attributes().with_checks(false) {
+                            let a = a.map_err(|e| anyhow!(e.to_string()))?;
+                            let key = a.key.as_ref();
+                            let val = a.unescape_value().map_err(|e| anyhow!(e.to_string()))?;
+                            let v = val.as_ref();
+
+                            match key {
+                                b"yMin" => line_ymin = parse_f32_attr(v),
+                                b"yMax" => line_ymax = parse_f32_attr(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"word" => {
+                        in_word = true;
+                        word_text.clear();
+
+                        w_xmin = None;
+                        w_ymin = None;
+                        w_xmax = None;
+                        w_ymax = None;
+
+                        for a in e.attributes().with_checks(false) {
+                            let a = a.map_err(|e| anyhow!(e.to_string()))?;
+                            let key = a.key.as_ref();
+                            let val = a.unescape_value().map_err(|e| anyhow!(e.to_string()))?;
+                            let v = val.as_ref();
+
+                            match key {
+                                b"xMin" => w_xmin = parse_f32_attr(v),
+                                b"yMin" => w_ymin = parse_f32_attr(v),
+                                b"xMax" => w_xmax = parse_f32_attr(v),
+                                b"yMax" => w_ymax = parse_f32_attr(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(Event::Text(t)) => {
+                if in_word {
+                    let s = reader
+                        .decoder()
+                        .decode(t.as_ref())
+                        .map_err(|e| anyhow!(e.to_string()))?;
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        word_text.push_str(s);
+                    }
+                }
+            }
+
+            Ok(Event::End(e)) => {
+                match e.name().as_ref() {
+                    b"word" => {
+                        in_word = false;
+
+                        let text = word_text.trim().to_string();
+                        if !text.is_empty() {
+                            if let (Some(x1), Some(y1), Some(x2), Some(y2)) =
+                                (w_xmin, w_ymin, w_xmax, w_ymax)
+                            {
+                                line_words.push(WordBox {
+                                    x_min: x1,
+                                    y_min: y1,
+                                    x_max: x2,
+                                    y_max: y2,
+                                    text,
+                                });
+                            }
+                        }
+                        word_text.clear();
+                    }
+                    b"line" => {
+                        in_line = false;
+
+                        if !line_words.is_empty() {
+                            // sort słów w linii po X
+                            line_words.sort_by(|a, b| {
+                                a.x_min
+                                    .partial_cmp(&b.x_min)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+
+                            let x_min = line_words.first().map(|w| w.x_min).unwrap_or(0.0);
+                            let x_max = line_words.last().map(|w| w.x_max).unwrap_or(0.0);
+
+                            let ymin = line_ymin.unwrap_or_else(|| {
+                                line_words.iter().map(|w| w.y_min).fold(f32::INFINITY, f32::min)
+                            });
+                            let ymax = line_ymax.unwrap_or_else(|| {
+                                line_words.iter().map(|w| w.y_max).fold(f32::NEG_INFINITY, f32::max)
+                            });
+
+                            out.push(LineBox {
+                                y_min: ymin,
+                                y_max: ymax,
+                                x_min,
+                                x_max,
+                                words: line_words.clone(),
+                                block_break_before: pending_block_break,
+                            });
+
+                            // block-break zużyty przy pierwszej linii po <block>
+                            pending_block_break = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow!(e.to_string())),
+            _ => {}
+        }
+
+        buf.clear();
+    }
+
+    Ok(out)
+}
+
+
+========
+pub fn bbox_layout_xhtml_to_md(xhtml: &str) -> Result<String> {
+    let lines = parse_bbox_layout_lines(xhtml)?;
+    Ok(render_lines_to_markdown_layout(lines))
+}
+
+
+======
+fn render_lines_to_markdown_layout(lines: Vec<LineBox>) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Progi (można stroić na realnych PDF-ach)
+    let paragraph_gap: f32 = 10.0;
+    let list_continuation_indent_px: f32 = 18.0;
+
+    // Szacunek lewego marginesu body (prosty, ale wystarcza)
+    let mut body_left = f32::INFINITY;
+    for l in &lines {
+        let t = line_to_text(l);
+        if t.len() >= 20 {
+            body_left = body_left.min(l.x_min);
+        }
+    }
+    if !body_left.is_finite() {
+        body_left = lines.first().map(|l| l.x_min).unwrap_or(0.0);
+    }
+
+    // Szerokość “typowej” linii
+    let mut widths: Vec<f32> = lines
+        .iter()
+        .map(|l| (l.x_max - body_left).max(0.0))
+        .collect();
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let body_width = widths.get(widths.len() / 2).copied().unwrap_or(500.0);
+
+    let mut out = String::new();
+
+    let mut in_list: bool = false;
+    let mut last_list_indent_x: f32 = 0.0;
+
+    for i in 0..lines.len() {
+        let line = &lines[i];
+        let text = line_to_text(line);
+
+        if text.is_empty() {
+            continue;
+        }
+
+        let prev_gap = if i == 0 {
+            999.0
+        } else {
+            (line.y_min - lines[i - 1].y_max).abs()
+        };
+
+        let next_gap = if i + 1 >= lines.len() {
+            999.0
+        } else {
+            (lines[i + 1].y_min - line.y_max).abs()
+        };
+
+        // Block break = nowy akapit
+        if line.block_break_before {
+            if in_list {
+                out.push_str("\n\n");
+                in_list = false;
+            } else if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+        }
+
+        // --- heurystyka nagłówka (jak wcześniej, tylko na gotowych liniach) ---
+        let line_w = (line.x_max - line.x_min).max(0.0);
+        let short_line = line_w < body_width * 0.75;
+        let separated = prev_gap >= 12.0 && next_gap >= 12.0;
+        let not_body_start = (line.x_min - body_left).abs() > 4.0;
+
+        let looks_like_heading = text.len() <= 120 && short_line && (separated || not_body_start);
+
+        if looks_like_heading {
+            if in_list {
+                out.push_str("\n\n");
+                in_list = false;
+            } else if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+
+            let level = if line_w < body_width * 0.45 { "##" } else { "###" };
+            out.push_str(level);
+            out.push(' ');
+            out.push_str(text.trim());
+            out.push_str("\n\n");
+            continue;
+        }
+
+        // --- listy ---
+        let first_token = line.words.first().map(|w| w.text.trim()).unwrap_or("");
+        let is_bullet = matches!(first_token, "-" | "•" | "*" | "·" | "o" | "–" | "—");
+        let is_ordered = {
+            let b = first_token.as_bytes();
+            let mut j = 0;
+            while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+            j > 0 && j < b.len() && matches!(b[j] as char, '.' | ')')
+        };
+
+        if is_bullet || is_ordered {
+            if !in_list {
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push_str("\n\n");
+                }
+                in_list = true;
+            } else if !out.ends_with('\n') {
+                out.push('\n');
+            }
+
+            last_list_indent_x = line.x_min;
+
+            let item_text = line.words.iter().skip(1).map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            let item_text = item_text.trim();
+
+            if is_ordered {
+                out.push_str("1. ");
+            } else {
+                out.push_str("- ");
+            }
+            out.push_str(item_text);
+            continue;
+        }
+
+        // kontynuacja itemu listy (zawijanie)
+        if in_list {
+            if line.x_min >= last_list_indent_x + list_continuation_indent_px && prev_gap < paragraph_gap {
+                out.push('\n');
+                out.push_str("   ");
+                out.push_str(text.trim());
+                continue;
+            }
+
+            out.push_str("\n\n");
+            in_list = false;
+        }
+
+        // zwykłe akapity
+        if out.is_empty() {
+            out.push_str(text.trim());
+        } else if prev_gap >= paragraph_gap {
+            if !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+            out.push_str(text.trim());
+        } else {
+            out.push('\n');
+            out.push_str(text.trim());
+        }
+    }
+
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
