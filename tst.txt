@@ -1,0 +1,18 @@
+// =======================
+    // LOCAL MODE (NO DB/GCS)
+    // =======================
+    if let (Some(local_pdf), Some(local_out_dir)) = (&cli.local_pdf, &cli.local_out_dir) {
+        let md = pdf_local_path_to_md(local_pdf, cli.pdf2md_engine)?;
+        let out_path = local_out_dir.join(
+            local_pdf
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+                + ".md",
+        );
+        std::fs::create_dir_all(local_out_dir)?;
+        std::fs::write(&out_path, md)?;
+        info!("Local test finished. Output: {:?}", out_path);
+        return Ok(());
+    }
