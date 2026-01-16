@@ -1,0 +1,161 @@
+#[derive(Debug, Clone, Copy)]
+enum ListKind {
+    Unordered,
+    Ordered,
+}
+
+#[derive(Debug, Clone)]
+struct ListMarker {
+    kind: ListKind,
+    // ile pierwszych "word" w linii stanowi marker (zwykle 1, czasem 2)
+    consume_words: usize,
+}
+
+// bardzo praktyczne: nie tylko "-" ale też "•", "–", itp.
+fn parse_list_marker(line: &LineBox) -> Option<ListMarker> {
+    let w0 = line.words.get(0)?.text.trim();
+    if w0.is_empty() {
+        return None;
+    }
+
+    // Unordered bullets
+    if matches!(w0, "-" | "•" | "*" | "·" | "o" | "–" | "—") {
+        return Some(ListMarker { kind: ListKind::Unordered, consume_words: 1 });
+    }
+
+    // Ordered numeric: "1." / "1)" / "10." / "10)" / "(1)" — różne PDF-y różnie tną
+    // przypadek 1: "1." jako jeden word
+    if looks_like_ordered_token(w0) {
+        return Some(ListMarker { kind: ListKind::Ordered, consume_words: 1 });
+    }
+
+    // przypadek 2: "(1)" bywa rozbite na "(", "1", ")" albo "(1" + ")"
+    // tu ogarniamy 2-word minimalnie: "(1" + ")" lub "(" + "1.)"
+    let w1 = line.words.get(1).map(|w| w.text.trim()).unwrap_or("");
+    if !w1.is_empty() {
+        let two = format!("{}{}", w0, w1);
+        if looks_like_ordered_token(&two) {
+            return Some(ListMarker { kind: ListKind::Ordered, consume_words: 2 });
+        }
+    }
+
+    None
+}
+
+fn looks_like_ordered_token(s: &str) -> bool {
+    // usuń nawiasy wiodące/końcowe
+    let s = s.trim();
+    let s = s.trim_start_matches('(').trim_end_matches(')');
+
+    // numerycznie: [0-9]+[.)]
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() {
+        return false;
+    }
+
+    matches!(bytes[i] as char, '.' | ')')
+}
+
+
+===
+
+fn content_x_min_after_marker(line: &LineBox, consume_words: usize) -> f32 {
+    line.words
+        .get(consume_words)
+        .map(|w| w.x_min)
+        .unwrap_or(line.x_min)
+}
+
+==
+
+    // --- list state ---
+    let indent_step_px: f32 = 22.0;            // stroić
+    let continuation_gap_px: f32 = 10.0;       // stroić
+    let continuation_indent_px: f32 = 18.0;    // stroić
+
+    let mut in_list = false;
+    let mut list_base_content_x: f32 = 0.0; // anchor dla poziomu 0
+    let mut last_item_content_x: f32 = 0.0; // anchor bieżącego itemu
+    let mut last_level: usize = 0;
+
+    // ...
+    // w pętli po liniach, po headingach i block_break_before:
+
+        if let Some(marker) = parse_list_marker(line) {
+            // start / kontynuacja listy
+            let item_content_x = content_x_min_after_marker(line, marker.consume_words);
+
+            if !in_list {
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push_str("\n\n");
+                }
+                in_list = true;
+                list_base_content_x = item_content_x;
+                last_level = 0;
+            }
+
+            // nesting z wcięcia
+            let raw = ((item_content_x - list_base_content_x) / indent_step_px).round();
+            let level = raw.max(0.0) as usize;
+            last_level = level;
+            last_item_content_x = item_content_x;
+
+            // zbuduj prefix z wcięciem
+            for _ in 0..level {
+                out.push_str("  "); // 2 spacje na poziom (MD nesting)
+            }
+
+            match marker.kind {
+                ListKind::Ordered => out.push_str("1. "),
+                ListKind::Unordered => out.push_str("- "),
+            }
+
+            // treść itemu = słowa po markerze
+            let item_text = line.words
+                .iter()
+                .skip(marker.consume_words)
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(item_text.trim());
+            continue;
+        }
+
+        // kontynuacja itemu listy (zawijanie)
+        if in_list {
+            let is_close_vertically = prev_gap < continuation_gap_px;
+
+            // przyjmujemy, że kontynuacja zaczyna się mniej więcej tam gdzie content itemu
+            let content_x = line.x_min; // fallback
+            let likely_continuation =
+                is_close_vertically &&
+                content_x >= last_item_content_x - 2.0 && // tolerancja
+                content_x <= last_item_content_x + continuation_indent_px;
+
+            if likely_continuation {
+                out.push('\n');
+                // indent dla kontynuacji: level + 1 "tab" w markdown
+                for _ in 0..last_level {
+                    out.push_str("  ");
+                }
+                out.push_str("   ");
+                out.push_str(text.trim());
+                continue;
+            }
+
+            // wyjście z listy
+            out.push_str("\n\n");
+            in_list = false;
+        }
+
+
+==
+
