@@ -1,0 +1,413 @@
+fn render_pages_to_md(pages: Vec<PageBox>) -> String {
+    let mut out = String::new();
+
+    for (pi, page) in pages.iter().enumerate() {
+        let mut blocks = page.blocks.clone();
+        blocks.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
+
+        // body_left = median x_min bloków
+        let mut xmins: Vec<f32> = blocks.iter().map(|b| b.x_min).collect();
+        xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
+
+        for block in &blocks {
+            if block.lines.is_empty() {
+                continue;
+            }
+
+            let mut lines = block.lines.clone();
+            lines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
+
+            let indent = block.x_min - body_left;
+
+            // NOTE: strojenie progu per Twoje PDF-y
+            let is_note = indent >= 30.0;
+
+            if is_note {
+                let txt = render_block_lines_to_md(&lines);
+                if !txt.is_empty() {
+                    out.push_str("> [!NOTE]\n");
+                    for ln in txt.lines() {
+                        let ln = ln.trim();
+                        if !ln.is_empty() {
+                            out.push_str("> ");
+                            out.push_str(ln);
+                            out.push('\n');
+                        }
+                    }
+                    out.push('\n');
+                }
+            } else {
+                let txt = render_block_lines_to_md(&lines);
+                if !txt.is_empty() {
+                    out.push_str(txt.trim());
+                    out.push_str("\n\n");
+                }
+            }
+        }
+
+        if pi + 1 < pages.len() {
+            out.push_str("\n---\n\n");
+        }
+    }
+
+    out
+}
+
+===
+
+fn render_block_lines_to_md(lines: &[LineBox]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // strojenie progów na realnych PDF-ach
+    let paragraph_gap: f32 = 10.0;
+    let list_continuation_indent_px: f32 = 18.0;
+
+    // body_left (lokalnie dla bloku; i tak działa lepiej niż nic)
+    let mut body_left = f32::INFINITY;
+    for l in lines {
+        let t = line_to_text(l);
+        if t.len() >= 20 {
+            body_left = body_left.min(l.x_min);
+        }
+    }
+    if !body_left.is_finite() {
+        body_left = lines.first().map(|l| l.x_min).unwrap_or(0.0);
+    }
+
+    // typowa szerokość linii
+    let mut widths: Vec<f32> = lines
+        .iter()
+        .map(|l| (l.x_max - body_left).max(0.0))
+        .collect();
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let body_width = widths.get(widths.len() / 2).copied().unwrap_or(500.0);
+
+    let mut out = String::new();
+    let mut in_list = false;
+    let mut last_list_indent_x: f32 = 0.0;
+
+    for i in 0..lines.len() {
+        let line = &lines[i];
+        let text = line_to_text(line);
+        if text.is_empty() {
+            continue;
+        }
+
+        let prev_gap = if i == 0 {
+            999.0
+        } else {
+            (line.y_min - lines[i - 1].y_max).abs()
+        };
+
+        let next_gap = if i + 1 >= lines.len() {
+            999.0
+        } else {
+            (lines[i + 1].y_min - line.y_max).abs()
+        };
+
+        // NOWY BLOK (z pending_block_break) => akapit
+        if line.block_break_before {
+            if in_list {
+                out.push_str("\n\n");
+                in_list = false;
+            } else if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+        }
+
+        // --- heading (na poziomie linii) ---
+        let line_w = (line.x_max - line.x_min).max(0.0);
+        let short_line = line_w < body_width * 0.75;
+        let separated = prev_gap >= 12.0 && next_gap >= 12.0;
+        let not_body_start = (line.x_min - body_left).abs() > 4.0;
+
+        let looks_like_heading = text.len() <= 120 && short_line && (separated || not_body_start);
+        if looks_like_heading {
+            if in_list {
+                out.push_str("\n\n");
+                in_list = false;
+            } else if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+
+            let level = if line_w < body_width * 0.45 { "##" } else { "###" };
+            out.push_str(level);
+            out.push(' ');
+            out.push_str(text.trim());
+            out.push_str("\n\n");
+            continue;
+        }
+
+        // --- listy ---
+        let first_token = line.words.first().map(|w| w.text.trim()).unwrap_or("");
+        let is_bullet = matches!(first_token, "-" | "•" | "*" | "·" | "o" | "–" | "—");
+        let is_ordered = {
+            let b = first_token.as_bytes();
+            let mut j = 0;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            j > 0 && j < b.len() && matches!(b[j] as char, '.' | ')')
+        };
+
+        if is_bullet || is_ordered {
+            if !in_list {
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push_str("\n\n");
+                }
+                in_list = true;
+            } else if !out.ends_with('\n') {
+                out.push('\n');
+            }
+
+            last_list_indent_x = line.x_min;
+
+            let item_text = line
+                .words
+                .iter()
+                .skip(1)
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let item_text = item_text.trim();
+
+            if is_ordered {
+                out.push_str("1. ");
+            } else {
+                out.push_str("- ");
+            }
+            out.push_str(item_text);
+            continue;
+        }
+
+        // kontynuacja listy (zawijanie)
+        if in_list {
+            if line.x_min >= last_list_indent_x + list_continuation_indent_px && prev_gap < paragraph_gap {
+                out.push('\n');
+                out.push_str("   ");
+                out.push_str(text.trim());
+                continue;
+            }
+
+            out.push_str("\n\n");
+            in_list = false;
+        }
+
+        // zwykłe akapity
+        if out.is_empty() {
+            out.push_str(text.trim());
+        } else if prev_gap >= paragraph_gap {
+            if !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+            out.push_str(text.trim());
+        } else {
+            out.push('\n');
+            out.push_str(text.trim());
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+==
+
+#[derive(Debug, Clone)]
+struct IndexedBlock {
+    idx: usize,
+    block: BlockBox,
+}
+
+#[derive(Debug, Clone)]
+struct NoteAttachment {
+    body_idx: usize,
+    note: BlockBox,
+}
+
+
+===
+
+fn is_note_block(block: &BlockBox, body_left: f32, note_indent_px: f32) -> bool {
+    (block.x_min - body_left) >= note_indent_px
+}
+
+fn attach_notes_to_bodies(
+    blocks_sorted_by_y: &[BlockBox],
+    body_left: f32,
+    note_indent_px: f32,
+    attach_max_gap_px: f32,
+) -> (Vec<BlockBox>, Vec<NoteAttachment>, Vec<BlockBox>) {
+    // Zwraca:
+    // 1) bodies w kolejności Y,
+    // 2) notki przypięte do konkretnego body (po indeksie body w vec bodies),
+    // 3) notki nieprzypięte (fallback)
+
+    let mut bodies: Vec<BlockBox> = Vec::new();
+    let mut notes: Vec<BlockBox> = Vec::new();
+
+    for b in blocks_sorted_by_y {
+        if is_note_block(b, body_left, note_indent_px) {
+            notes.push(b.clone());
+        } else {
+            bodies.push(b.clone());
+        }
+    }
+
+    // indeksowanie bodies z pozycją w bodies vec
+    let indexed_bodies: Vec<IndexedBlock> = bodies
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, block)| IndexedBlock { idx, block })
+        .collect();
+
+    let mut attachments: Vec<NoteAttachment> = Vec::new();
+    let mut loose_notes: Vec<BlockBox> = Vec::new();
+
+    for note in notes {
+        // szukamy najlepszego body: ostatni powyżej notki, z minimalnym dystansem pionowym
+        let mut best: Option<(usize, f32)> = None; // (body_idx, gap)
+
+        for ib in &indexed_bodies {
+            if ib.block.y_min <= note.y_min {
+                let gap = (note.y_min - ib.block.y_max).max(0.0);
+                if gap <= attach_max_gap_px {
+                    match best {
+                        None => best = Some((ib.idx, gap)),
+                        Some((_, best_gap)) => {
+                            if gap < best_gap {
+                                best = Some((ib.idx, gap));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((body_idx, _gap)) = best {
+            attachments.push(NoteAttachment { body_idx, note });
+        } else {
+            loose_notes.push(note);
+        }
+    }
+
+    // stabilność: jeśli wiele notek przypiętych do jednego body, sort po y_min
+    attachments.sort_by(|a, b| {
+        a.body_idx
+            .cmp(&b.body_idx)
+            .then_with(|| a.note.y_min.partial_cmp(&b.note.y_min).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    (bodies, attachments, loose_notes)
+}
+
+
+===
+
+fn render_note_block_as_callout(lines: &[LineBox]) -> String {
+    let txt = render_block_lines_to_md(lines);
+    if txt.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("> [!NOTE]\n");
+    for ln in txt.lines() {
+        let ln = ln.trim();
+        if !ln.is_empty() {
+            out.push_str("> ");
+            out.push_str(ln);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out
+}
+
+
+===
+
+fn render_pages_to_md(pages: Vec<PageBox>) -> String {
+    let mut out = String::new();
+
+    // progi do strojenia
+    let note_indent_px: f32 = 30.0;
+    let attach_max_gap_px: f32 = 90.0;
+
+    for (pi, page) in pages.iter().enumerate() {
+        let mut blocks = page.blocks.clone();
+        blocks.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
+
+        // body_left = median x_min bloków
+        let mut xmins: Vec<f32> = blocks.iter().map(|b| b.x_min).collect();
+        xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
+
+        let (bodies, attachments, loose_notes) =
+            attach_notes_to_bodies(&blocks, body_left, note_indent_px, attach_max_gap_px);
+
+        // map: body_idx -> Vec<note>
+        let mut attached_map: std::collections::BTreeMap<usize, Vec<BlockBox>> = std::collections::BTreeMap::new();
+        for a in attachments {
+            attached_map.entry(a.body_idx).or_default().push(a.note);
+        }
+
+        // render body w kolejności Y, po każdym body doklej jego notki
+        for (bi, body) in bodies.iter().enumerate() {
+            if body.lines.is_empty() {
+                continue;
+            }
+
+            let mut lines = body.lines.clone();
+            lines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
+
+            let body_txt = render_block_lines_to_md(&lines);
+            if !body_txt.trim().is_empty() {
+                out.push_str(body_txt.trim());
+                out.push_str("\n\n");
+            }
+
+            if let Some(notes_for_body) = attached_map.get(&bi) {
+                for note in notes_for_body {
+                    if note.lines.is_empty() {
+                        continue;
+                    }
+                    let mut nlines = note.lines.clone();
+                    nlines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
+
+                    let note_txt = render_note_block_as_callout(&nlines);
+                    if !note_txt.trim().is_empty() {
+                        out.push_str(&note_txt);
+                    }
+                }
+            }
+        }
+
+        // fallback: luźne notki (nieprzypięte) wyrzuć na koniec strony
+        // (alternatywnie: render w kolejności Y razem z bodies, ale osobno; tu jest najprostsze i czytelne)
+        if !loose_notes.is_empty() {
+            out.push_str("\n");
+            for note in loose_notes {
+                if note.lines.is_empty() {
+                    continue;
+                }
+                let mut nlines = note.lines.clone();
+                nlines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
+                let note_txt = render_note_block_as_callout(&nlines);
+                if !note_txt.trim().is_empty() {
+                    out.push_str(&note_txt);
+                }
+            }
+            out.push('\n');
+        }
+
+        if pi + 1 < pages.len() {
+            out.push_str("\n---\n\n");
+        }
+    }
+
+    out
+}
