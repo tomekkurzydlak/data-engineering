@@ -499,3 +499,96 @@ fn inject_bbox_notes_into_layout_md(md: String, _bbox_pages: &[PageBox]) -> Stri
     // Zostawiamy hook. Kolejny krok: wykrywanie "box-like" notek i wpinanie ich po najbliższym akapicie.
     md
 }
+
+==
+
+pub fn render_pages_to_md_hybrid_test_adapter(pages: Vec<PageBox>) -> String {
+    // Adapter tylko do testów w main: masz już PageBox z bbox-layout,
+    // więc robimy z tego "layout-like" tekst stron (monospace-ish),
+    // a potem puszczamy przez render_layout_to_md(&str).
+    //
+    // To NIE jest produkcyjna ścieżka tabel — produkcyjnie layout bierzesz z pdftotext -layout.
+    let layout_txt = bbox_pages_to_pseudo_layout_text(&pages);
+    render_layout_to_md(&layout_txt)
+}
+
+fn bbox_pages_to_pseudo_layout_text(pages: &[PageBox]) -> String {
+    // Bardzo prosty “layout”: linie renderujemy w kolejności Y,
+    // a w obrębie linii trzymamy odstępy na podstawie x_min.
+    //
+    // Skala znaków/px jest przybliżona, ale wystarczy, żeby:
+    // - wykrywacz tabel (w layout rendererze) zobaczył "kolumny" (duże przerwy)
+    // - headingi zostały w kolejności.
+    let px_per_char: f32 = 6.5; // strojenie: dla wielu PDF działa ~6-7 px/znak
+
+    let mut out = String::new();
+
+    for (pi, p) in pages.iter().enumerate() {
+        // zbierz wszystkie linie ze strony jako (y_min, Vec<(x_min, text)>)
+        let mut lines: Vec<(f32, Vec<(f32, String)>)> = Vec::new();
+
+        for b in &p.blocks {
+            for l in &b.lines {
+                let t = line_to_text(l);
+                let t = t.trim();
+                if t.is_empty() {
+                    continue;
+                }
+
+                // zbierz pozycję startu linii (najlepiej po pierwszym słowie)
+                let x0 = l.words.first().map(|w| w.x_min).unwrap_or(l.x_min);
+
+                lines.push((l.y_min, vec![(x0, t.to_string())]));
+            }
+        }
+
+        // sort po Y
+        lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // “scal” linie o prawie tym samym y (pdftotext bbox czasem daje minimalne różnice)
+        let y_merge_tol: f32 = 2.2;
+        let mut merged: Vec<(f32, Vec<(f32, String)>)> = Vec::new();
+        for (y, parts) in lines {
+            if let Some((last_y, last_parts)) = merged.last_mut() {
+                if (y - *last_y).abs() <= y_merge_tol {
+                    last_parts.extend(parts);
+                    continue;
+                }
+            }
+            merged.push((y, parts));
+        }
+
+        for (_y, mut parts) in merged {
+            // sort po X w obrębie tej samej linii
+            parts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            // render monospace z odstępami wg x
+            let mut line = String::new();
+            let mut cur_col: usize = 0;
+
+            for (x, txt) in parts {
+                let target_col = ((x / px_per_char).round() as isize).max(0) as usize;
+                if target_col > cur_col {
+                    line.push_str(&" ".repeat(target_col - cur_col));
+                    cur_col = target_col;
+                } else if !line.is_empty() {
+                    // minimalny odstęp między fragmentami, jeśli są bardzo blisko
+                    line.push(' ');
+                    cur_col += 1;
+                }
+
+                line.push_str(&txt);
+                cur_col = line.len();
+            }
+
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+
+        if pi + 1 < pages.len() {
+            out.push('\x0C'); // separator stron jak w pdftotext -layout
+        }
+    }
+
+    out
+}
