@@ -3,24 +3,27 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
         return Vec::new();
     }
 
-    // ---- strojenie ----
-    let band_h: f32 = 20.0;            // grupowanie wierszy
-    let x_cluster_tol: f32 = 14.0;     // tolerancja klastrów kolumn
-    let min_region_bands: usize = 3;   // min liczba bandów w regionie
+    // strojenie
+    let band_h: f32 = 20.0;
+    let x_cluster_tol: f32 = 14.0;
+
+    let min_region_bands: usize = 3;
     let min_cols: usize = 2;
 
-    // cechy “tabelowe”
-    let max_avg_cell_len: f32 = 170.0;     // tabela porównawcza może mieć dłuższe komórki
-    let min_multi_col_band_ratio: f32 = 0.70; // większość bandów ma >=2 kolumny z treścią
-    let min_shortish_ratio: f32 = 0.35;    // konserwatywnie (tabele porównawcze mają dłuższe teksty)
+    let max_avg_cell_len: f32 = 190.0;
+    let min_multi_col_band_ratio: f32 = 0.70;
+    let min_shortish_ratio: f32 = 0.25;
 
-    // marginesy Y, żeby nie gubić krawędzi
-    let region_y_margin: f32 = 8.0;
+    // margines aby nie gubić krawędzi tabeli
+    let region_y_margin: f32 = 10.0;
+
+    // kiedy scalać „kontynuacje”
+    let continuation_y_gap: f32 = 26.0;
 
     // ---- bandy po center_y ----
     let mut bands: std::collections::BTreeMap<i64, Vec<&BlockBox>> = std::collections::BTreeMap::new();
     for b in blocks_sorted_by_y {
-        let key = ((b.y_min + b.y_max) * 0.5 / band_h).round() as i64;
+        let key = (((b.y_min + b.y_max) * 0.5) / band_h).round() as i64;
         bands.entry(key).or_default().push(b);
     }
 
@@ -29,14 +32,11 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
         k: i64,
         y1: f32,
         y2: f32,
-        col_x: Vec<f32>,
         filled_cols: usize,
         avg_cell_len: f32,
         shortish_ratio: f32,
-        n_cells: usize,
     }
 
-    // pomocniczo: przypisz do najbliższej kolumny
     fn nearest_col(x: f32, cols: &[f32]) -> usize {
         let mut best_i = 0usize;
         let mut best_d = f32::INFINITY;
@@ -50,15 +50,14 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
         best_i
     }
 
-    // ---- policz cechy bandów ----
-    let mut infos: Vec<BandInfo> = Vec::new();
+    // policz cechy bandów
+    let mut band_infos: Vec<(i64, BandInfo, Vec<f32>)> = Vec::new(); // (k, info, col_x)
 
     for (&k, v) in &bands {
         let mut xs: Vec<f32> = Vec::new();
         let mut y1 = f32::INFINITY;
         let mut y2 = f32::NEG_INFINITY;
 
-        // weź tylko sensowne tekstowo bloki do budowy klastrów
         let mut candidates: Vec<(&BlockBox, usize)> = Vec::new();
         for b in v {
             let t = block_text_norm(b);
@@ -82,7 +81,6 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
             continue;
         }
 
-        // policz obsadzenie kolumn i statystyki komórek
         let mut col_counts = vec![0usize; col_x.len()];
         let mut cell_lens: Vec<usize> = Vec::new();
 
@@ -94,7 +92,6 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
 
         let filled_cols = col_counts.iter().filter(|c| **c > 0).count();
         if filled_cols < 2 {
-            // w bandzie realnie jest treść tylko w jednej kolumnie => nie jest “wierszem tabeli”
             continue;
         }
 
@@ -102,161 +99,82 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
         let shortish = cell_lens.iter().filter(|l| **l <= 80).count();
         let shortish_ratio = shortish as f32 / cell_lens.len().max(1) as f32;
 
-        infos.push(BandInfo {
+        let info = BandInfo {
             k,
             y1: if y1.is_finite() { y1 } else { (k as f32 - 0.5) * band_h },
             y2: if y2.is_finite() { y2 } else { (k as f32 + 0.5) * band_h },
-            col_x,
             filled_cols,
             avg_cell_len,
             shortish_ratio,
-            n_cells: cell_lens.len(),
-        });
+        };
+
+        band_infos.push((k, info, col_x));
     }
 
-    if infos.is_empty() {
+    if band_infos.is_empty() {
         return Vec::new();
     }
 
-    infos.sort_by(|a, b| a.k.cmp(&b.k));
+    band_infos.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // ---- wybierz bandy “tabelowe” (kandydaci) ----
-    let mut is_table_band: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
-    for bi in &infos {
-        let ok = bi.filled_cols >= 2 && bi.avg_cell_len <= max_avg_cell_len;
-        is_table_band.insert(bi.k, ok);
-    }
-
-    // ---- złącz bandy w regiony ----
-    let mut regions_raw: Vec<(i64, i64)> = Vec::new();
-    let mut start_k: Option<i64> = None;
-    let mut prev_k: i64 = 0;
-
-    for bi in &infos {
-        let ok = *is_table_band.get(&bi.k).unwrap_or(&false);
+    // bandy “tabelowe”
+    let mut good: Vec<i64> = Vec::new();
+    for (k, info, _cols) in &band_infos {
+        let ok = info.filled_cols >= 2 && info.avg_cell_len <= max_avg_cell_len;
         if ok {
-            if start_k.is_none() {
-                start_k = Some(bi.k);
-                prev_k = bi.k;
-            } else if bi.k == prev_k + 1 {
-                prev_k = bi.k;
-            } else {
-                regions_raw.push((start_k.unwrap(), prev_k));
-                start_k = Some(bi.k);
-                prev_k = bi.k;
-            }
-        } else if let Some(sk) = start_k.take() {
-            regions_raw.push((sk, prev_k));
+            good.push(*k);
         }
     }
-    if let Some(sk) = start_k.take() {
-        regions_raw.push((sk, prev_k));
+    if good.is_empty() {
+        return Vec::new();
     }
 
-    // ---- helper: “przytnij” kolumny do tych z realnym supportem ----
-    fn refine_columns_by_support(
-        blocks: &[BlockBox],
-        y1: f32,
-        y2: f32,
-        mut col_x: Vec<f32>,
-        x_tol: f32,
-    ) -> Vec<f32> {
-        if col_x.len() <= 2 {
-            col_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            return col_x;
+    // regiony jako ciągi kolejnych bandów
+    good.sort();
+    let mut regions_k: Vec<(i64, i64)> = Vec::new();
+    let mut sk = good[0];
+    let mut pk = good[0];
+    for &k in good.iter().skip(1) {
+        if k == pk + 1 {
+            pk = k;
+        } else {
+            regions_k.push((sk, pk));
+            sk = k;
+            pk = k;
         }
-
-        col_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mut counts = vec![0usize; col_x.len()];
-
-        for b in blocks {
-            // overlap Y, nie center
-            if b.y_max < y1 || b.y_min > y2 {
-                continue;
-            }
-            let t = block_text_norm(b);
-            if t.trim().is_empty() {
-                continue;
-            }
-
-            // nearest centroid
-            let mut best_i = 0usize;
-            let mut best_d = f32::INFINITY;
-            for (i, cx) in col_x.iter().enumerate() {
-                let d = (b.x_min - *cx).abs();
-                if d < best_d {
-                    best_d = d;
-                    best_i = i;
-                }
-            }
-            if best_d <= x_tol {
-                counts[best_i] += 1;
-            }
-        }
-
-        // threshold: odrzuć małe klastry (artefakty)
-        let max_c = *counts.iter().max().unwrap_or(&0);
-        let min_keep = std::cmp::max(3, (max_c as f32 * 0.25) as usize);
-
-        let mut kept: Vec<(f32, usize)> = col_x.into_iter().zip(counts.into_iter()).collect();
-        kept.retain(|(_, c)| *c >= min_keep);
-
-        // jeśli przez przypadek odrzuciliśmy za dużo, zachowaj 2 najmocniejsze
-        if kept.len() < 2 {
-            kept.sort_by(|a, b| b.1.cmp(&a.1));
-            kept.truncate(2);
-        }
-
-        // final: jeśli nadal >2, ale tabela w praktyce 2-kolumnowa, wybierz 2 najmocniejsze
-        if kept.len() > 2 {
-            kept.sort_by(|a, b| b.1.cmp(&a.1));
-            kept.truncate(2);
-        }
-
-        let mut cols: Vec<f32> = kept.into_iter().map(|(x, _)| x).collect();
-        cols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        cols
     }
+    regions_k.push((sk, pk));
 
-    // ---- final: regiony + filtr ratio ----
-    let mut out: Vec<TableRegion> = Vec::new();
+    // helper: policz ratio regionu
+    let band_map: std::collections::HashMap<i64, BandInfo> = band_infos
+        .iter()
+        .map(|(k, info, _)| (*k, info.clone()))
+        .collect();
 
-    for (sk, ek) in regions_raw {
-        let band_count = (ek - sk + 1) as usize;
-        if band_count < min_region_bands {
-            continue;
+    // helper: wyznacz y1/y2 regionu
+    let region_y = |sk: i64, ek: i64| -> Option<(f32, f32)> {
+        let mut y1 = f32::INFINITY;
+        let mut y2 = f32::NEG_INFINITY;
+        let mut any = false;
+
+        for k in sk..=ek {
+            if let Some(bi) = band_map.get(&k) {
+                any = true;
+                y1 = y1.min(bi.y1);
+                y2 = y2.max(bi.y2);
+            }
         }
-
-        let region_bands: Vec<&BandInfo> = infos.iter().filter(|bi| bi.k >= sk && bi.k <= ek).collect();
-        if region_bands.is_empty() {
-            continue;
+        if !any || !y1.is_finite() || !y2.is_finite() {
+            None
+        } else {
+            Some((y1 - region_y_margin, y2 + region_y_margin))
         }
+    };
 
-        let multi_col = region_bands.iter().filter(|bi| bi.filled_cols >= 2).count();
-        let multi_col_ratio = multi_col as f32 / region_bands.len().max(1) as f32;
-
-        let shortish_ratio_avg =
-            region_bands.iter().map(|bi| bi.shortish_ratio).sum::<f32>() / region_bands.len().max(1) as f32;
-
-        if multi_col_ratio < min_multi_col_band_ratio {
-            continue;
-        }
-        if shortish_ratio_avg < min_shortish_ratio {
-            continue;
-        }
-
-        // y-range regionu: z bandów
-        let mut y1 = region_bands.iter().map(|bi| bi.y1).fold(f32::INFINITY, f32::min);
-        let mut y2 = region_bands.iter().map(|bi| bi.y2).fold(f32::NEG_INFINITY, f32::max);
-        if !y1.is_finite() || !y2.is_finite() {
-            continue;
-        }
-        y1 -= region_y_margin;
-        y2 += region_y_margin;
-
-        // centroidy: zbierz x_min w regionie i zaklastruj
+    // helper: zbuduj kolumny regionu i “przytnij” do dwóch najsilniejszych
+    fn refine_region_columns(blocks: &[BlockBox], y1: f32, y2: f32, x_cluster_tol: f32) -> Vec<f32> {
         let mut xs: Vec<f32> = Vec::new();
-        for b in blocks_sorted_by_y {
+        for b in blocks {
             if b.y_max < y1 || b.y_min > y2 {
                 continue;
             }
@@ -267,35 +185,128 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
             xs.push(b.x_min);
         }
         if xs.len() < 4 {
+            return Vec::new();
+        }
+
+        let mut cols = cluster_xmins(xs, x_cluster_tol);
+        cols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // policz support
+        let mut counts = vec![0usize; cols.len()];
+        for b in blocks {
+            if b.y_max < y1 || b.y_min > y2 {
+                continue;
+            }
+            let t = block_text_norm(b);
+            if t.trim().is_empty() {
+                continue;
+            }
+            let mut best_i = 0usize;
+            let mut best_d = f32::INFINITY;
+            for (i, cx) in cols.iter().enumerate() {
+                let d = (b.x_min - *cx).abs();
+                if d < best_d {
+                    best_d = d;
+                    best_i = i;
+                }
+            }
+            if best_d <= 42.0 {
+                counts[best_i] += 1;
+            }
+        }
+
+        // odrzuć małe klastry
+        let max_c = *counts.iter().max().unwrap_or(&0);
+        let min_keep = std::cmp::max(3, (max_c as f32 * 0.25) as usize);
+
+        let mut kept: Vec<(f32, usize)> = cols.into_iter().zip(counts.into_iter()).collect();
+        kept.retain(|(_, c)| *c >= min_keep);
+
+        if kept.len() < 2 {
+            kept.sort_by(|a, b| b.1.cmp(&a.1));
+            kept.truncate(2);
+        }
+        if kept.len() > 2 {
+            kept.sort_by(|a, b| b.1.cmp(&a.1));
+            kept.truncate(2);
+        }
+
+        let mut out: Vec<f32> = kept.into_iter().map(|(x, _)| x).collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    // z regionów_k zbuduj regiony tabel z filtrami ratio
+    let mut regions: Vec<TableRegion> = Vec::new();
+
+    for (sk, ek) in regions_k {
+        let band_count = (ek - sk + 1) as usize;
+        if band_count < min_region_bands {
             continue;
         }
 
-        let mut col_x = cluster_xmins(xs, x_cluster_tol);
-        col_x = refine_columns_by_support(blocks_sorted_by_y, y1, y2, col_x, 42.0);
+        let mut bands_in: Vec<BandInfo> = Vec::new();
+        for k in sk..=ek {
+            if let Some(bi) = band_map.get(&k) {
+                bands_in.push(bi.clone());
+            }
+        }
+        if bands_in.is_empty() {
+            continue;
+        }
 
+        let multi_col = bands_in.iter().filter(|b| b.filled_cols >= 2).count();
+        let multi_col_ratio = multi_col as f32 / bands_in.len().max(1) as f32;
+
+        let shortish_ratio_avg = bands_in.iter().map(|b| b.shortish_ratio).sum::<f32>() / bands_in.len().max(1) as f32;
+
+        if multi_col_ratio < min_multi_col_band_ratio {
+            continue;
+        }
+        if shortish_ratio_avg < min_shortish_ratio {
+            continue;
+        }
+
+        let (y1, y2) = match region_y(sk, ek) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let col_x = refine_region_columns(blocks_sorted_by_y, y1, y2, x_cluster_tol);
         if col_x.len() < min_cols {
             continue;
         }
 
-        out.push(TableRegion { y1, y2, col_x });
+        regions.push(TableRegion { y1, y2, col_x });
     }
 
-    // scal bliskie regiony
-    out.sort_by(|a, b| a.y1.partial_cmp(&b.y1).unwrap_or(std::cmp::Ordering::Equal));
-    let merge_gap = 10.0;
+    if regions.is_empty() {
+        return Vec::new();
+    }
+
+    // ---- scal “kontynuacje” tabel: bliskie Y i podobne kolumny ----
+    regions.sort_by(|a, b| a.y1.partial_cmp(&b.y1).unwrap_or(std::cmp::Ordering::Equal));
+
+    fn cols_similar(a: &[f32], b: &[f32]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        // 2 kolumny: wystarczy, że x są blisko
+        for i in 0..a.len() {
+            if (a[i] - b[i]).abs() > 24.0 {
+                return false;
+            }
+        }
+        true
+    }
 
     let mut merged: Vec<TableRegion> = Vec::new();
-    for r in out {
+    for r in regions {
         if let Some(last) = merged.last_mut() {
-            if r.y1 <= last.y2 + merge_gap {
+            let gap = r.y1 - last.y2;
+            if gap <= continuation_y_gap && cols_similar(&last.col_x, &r.col_x) {
                 last.y2 = last.y2.max(r.y2);
-
-                // merge kolumn i refine jeszcze raz
-                let mut xs = last.col_x.clone();
-                xs.extend(r.col_x.clone());
-                let mut cc = cluster_xmins(xs, 18.0);
-                cc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                last.col_x = cc;
+                // kolumny zostaw z last (stabilniejsze)
             } else {
                 merged.push(r);
             }
@@ -306,157 +317,51 @@ pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion>
 
     merged
 }
-===
-
-pub fn render_table_region_to_md(blocks_sorted_by_y: &[BlockBox], region: &TableRegion) -> String {
-    // strojenie
-    let band_h: f32 = 20.0;
-    let y_row_merge_gap: f32 = 6.0; // tolerancja wiersza (gdy bandy lekko pływają)
-
-    if region.col_x.len() < 2 {
-        return String::new();
+==
+pub fn mark_table_blocks(blocks_sorted_by_y: &[BlockBox], regions: &[TableRegion]) -> Vec<bool> {
+    let mut mask = vec![false; blocks_sorted_by_y.len()];
+    if regions.is_empty() {
+        return mask;
     }
 
-    // 1) wybierz bloki w regionie (overlap Y)
-    let mut region_blocks: Vec<&BlockBox> = blocks_sorted_by_y
-        .iter()
-        .filter(|b| !(b.y_max < region.y1 || b.y_min > region.y2))
-        .collect();
+    // strojenie: jak daleko w X uznajemy “należy do kolumny”
+    let x_assign_tol: f32 = 52.0;
 
-    if region_blocks.is_empty() {
-        return String::new();
-    }
-
-    // 2) sort po Y a potem X
-    region_blocks.sort_by(|a, b| {
-        a.y_min
-            .partial_cmp(&b.y_min)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.x_min.partial_cmp(&b.x_min).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    // helper: nearest col
-    fn nearest_col(x: f32, cols: &[f32]) -> usize {
-        let mut best_i = 0usize;
-        let mut best_d = f32::INFINITY;
-        for (i, cx) in cols.iter().enumerate() {
-            let d = (x - *cx).abs();
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
-        }
-        best_i
-    }
-
-    // 3) zbuduj “row keys” stabilniej niż tylko (center_y/band_h)
-    //    Użyjemy y_min i będziemy scalać sąsiednie rzędy, jeśli są bardzo blisko
-    let mut rows: Vec<(f32, Vec<&BlockBox>)> = Vec::new(); // (row_y, blocks)
-
-    for b in region_blocks {
-        let row_y = b.y_min; // lepsze niż center_y dla tabel
-        if let Some((last_y, last_vec)) = rows.last_mut() {
-            if (row_y - *last_y).abs() <= y_row_merge_gap || (row_y - *last_y).abs() <= band_h * 0.5 {
-                last_vec.push(b);
-                continue;
-            }
-        }
-        rows.push((row_y, vec![b]));
-    }
-
-    // 4) buduj wiersze tabeli jako Vec<String> o len=col_count
-    let col_count = region.col_x.len();
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-
-    for (_y, mut bs) in rows {
-        bs.sort_by(|a, b| a.x_min.partial_cmp(&b.x_min).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut cells: Vec<Vec<String>> = vec![Vec::new(); col_count];
-
-        for b in bs {
-            let txt = block_text_norm(b);
-            let txt = txt.trim();
-            if txt.is_empty() {
-                continue;
-            }
-            let ci = nearest_col(b.x_min, &region.col_x);
-            cells[ci].push(txt.to_string());
-        }
-
-        let row_cells: Vec<String> = cells
-            .into_iter()
-            .map(|parts| normalize_ws(&parts.join(" ")))
-            .collect();
-
-        if row_cells.iter().all(|c| c.trim().is_empty()) {
+    for (i, b) in blocks_sorted_by_y.iter().enumerate() {
+        let txt = block_text_norm(b);
+        if txt.trim().is_empty() {
             continue;
         }
 
-        table_rows.push(row_cells);
-    }
+        for r in regions {
+            // overlap w osi Y
+            if b.y_max < r.y1 || b.y_min > r.y2 {
+                continue;
+            }
 
-    if table_rows.is_empty() {
-        return String::new();
-    }
+            // przypisz do najbliższej kolumny
+            let mut best_d = f32::INFINITY;
+            for cx in &r.col_x {
+                let d = (b.x_min - *cx).abs();
+                if d < best_d {
+                    best_d = d;
+                }
+            }
 
-    // 5) header
-    let first = &table_rows[0];
-    let has_header = looks_like_header_row(first);
-
-    let (header, data_rows) = if has_header {
-        (first.clone(), table_rows.into_iter().skip(1).collect::<Vec<_>>())
-    } else {
-        let mut h = Vec::new();
-        for i in 0..col_count {
-            h.push(format!("Kolumna {}", i + 1));
+            if best_d <= x_assign_tol {
+                mask[i] = true;
+                break;
+            }
         }
-        (h, table_rows)
-    };
-
-    // 6) emit MD table
-    let mut out = String::new();
-
-    out.push('|');
-    for c in &header {
-        out.push(' ');
-        out.push_str(&escape_md_cell(c.trim()));
-        out.push(' ');
-        out.push('|');
-    }
-    out.push('\n');
-
-    out.push('|');
-    for _ in 0..col_count {
-        out.push_str(" --- |");
-    }
-    out.push('\n');
-
-    for mut r in data_rows {
-        if r.len() < col_count {
-            r.resize(col_count, String::new());
-        } else if r.len() > col_count {
-            r.truncate(col_count);
-        }
-
-        out.push('|');
-        for c in &r {
-            out.push(' ');
-            out.push_str(&escape_md_cell(c.trim()));
-            out.push(' ');
-            out.push('|');
-        }
-        out.push('\n');
     }
 
-    out.push('\n');
-    out
+    mask
 }
-
-===
-
+==
 fn render_pages_to_md(pages: Vec<PageBox>) -> String {
     let mut out = String::new();
 
+    // notki
     let note_indent_px: f32 = 30.0;
     let attach_max_gap_px: f32 = 90.0;
 
@@ -464,34 +369,34 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
         let mut blocks = page.blocks.clone();
         blocks.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
 
-        // 1) wykryj regiony tabel
+        // 1) regiony tabel
         let table_regions = detect_table_regions(&blocks);
 
-        // 2) wyrenderuj tabele
-        for region in &table_regions {
-            let tmd = render_table_region_to_md(&blocks, region);
+        // 2) maska bloków tabelowych (Y overlap + X-nearest)
+        let table_mask = mark_table_blocks(&blocks, &table_regions);
+
+        // 3) render tabel (po regionach) — ważne: render opiera się o te same blocks,
+        //    ale do dalszego tekstu NIE przepuszczamy table_mask=true
+        for r in &table_regions {
+            let tmd = render_table_region_to_md(&blocks, r);
             if !tmd.trim().is_empty() {
                 out.push_str(&tmd);
             }
         }
 
-        // 3) odfiltruj bloki tabelaryczne (OVERLAP, nie center_y)
+        // 4) non-table
         let mut non_table_blocks: Vec<BlockBox> = Vec::new();
-        for b in &blocks {
-            let in_table = table_regions.iter().any(|r| !(b.y_max < r.y1 || b.y_min > r.y2));
-            if !in_table {
+        for (i, b) in blocks.iter().enumerate() {
+            if !table_mask[i] {
                 non_table_blocks.push(b.clone());
             }
         }
 
-        // 4) reszta: tekst + notki na blokach nietabelowych
+        // 5) tekst + notki tylko na non-table
         if !non_table_blocks.is_empty() {
-            non_table_blocks.sort_by(|a, b| {
-                a.y_min
-                    .partial_cmp(&b.y_min)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            non_table_blocks.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
 
+            // body_left na non-table
             let mut xmins: Vec<f32> = non_table_blocks.iter().map(|b| b.x_min).collect();
             xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
@@ -560,3 +465,4 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
 
     out
 }
+==
