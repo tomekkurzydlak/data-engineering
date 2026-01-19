@@ -1,714 +1,108 @@
-#[derive(Debug, Clone)]
-pub struct TableRegion {
-    pub y1: f32,
-    pub y2: f32,
-    pub col_x: Vec<f32>, // centroidy kolumn, zwykle 2
-}
-==
-pub fn normalize_ws(s: &str) -> String {
-    let mut out = String::new();
-    let mut prev_space = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
+fn is_note_block(
+    block: &BlockBox,
+    body_left: f32,
+    note_indent_px: f32,
+    table_regions: &[TableRegion],
+) -> bool {
+    // 0) jeśli blok w tabeli -> NIGDY note
+    if !table_regions.is_empty() {
+        let cy = (block.y_min + block.y_max) * 0.5;
+        let in_table = table_regions.iter().any(|r| cy >= r.y1 && cy <= r.y2);
+        if in_table {
+            return false;
         }
     }
-    out.trim().to_string()
-}
 
-pub fn escape_md_cell(s: &str) -> String {
-    // minimalnie: pipe i newlines
-    s.replace('|', r"\|").replace('\n', " ")
-}
+    let indent = block.x_min - body_left;
 
-pub fn block_text_norm(b: &BlockBox) -> String {
-    let mut lines = b.lines.clone();
-    lines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-    let joined = lines
+    // 1) indent musi być wyraźny
+    if indent < note_indent_px {
+        return false;
+    }
+
+    // 2) długość tekstu
+    let txt_len: usize = block
+        .lines
         .iter()
         .map(|l| line_to_text(l))
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalize_ws(&joined)
+        .map(|s| s.trim().len())
+        .sum::<usize>();
+
+    // 3) heurystyki notki
+    let few_lines = block.lines.len() <= 6;
+    let not_too_long = txt_len <= 600;
+
+    few_lines && not_too_long
 }
 
-pub fn cluster_xmins(mut xs: Vec<f32>, tol: f32) -> Vec<f32> {
-    if xs.is_empty() {
-        return Vec::new();
-    }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut clusters: Vec<Vec<f32>> = Vec::new();
-    let mut cur: Vec<f32> = vec![xs[0]];
+==
 
-    for x in xs.into_iter().skip(1) {
-        let last = *cur.last().unwrap();
-        if (x - last).abs() <= tol {
-            cur.push(x);
+fn attach_notes_to_bodies(
+    blocks_sorted_by_y: &[BlockBox],
+    body_left: f32,
+    note_indent_px: f32,
+    attach_max_gap_px: f32,
+    table_regions: &[TableRegion],
+) -> (Vec<BlockBox>, Vec<NoteAttachment>, Vec<BlockBox>) {
+    // 1) podział na bodies vs notes (notes wyłącznie poza tabelą)
+    let mut bodies: Vec<BlockBox> = Vec::new();
+    let mut notes: Vec<BlockBox> = Vec::new();
+
+    for b in blocks_sorted_by_y {
+        if is_note_block(b, body_left, note_indent_px, table_regions) {
+            notes.push(b.clone());
         } else {
-            clusters.push(cur);
-            cur = vec![x];
+            bodies.push(b.clone());
         }
     }
-    clusters.push(cur);
 
-    let mut centers: Vec<f32> = clusters
-        .into_iter()
-        .map(|c| c.iter().sum::<f32>() / (c.len().max(1) as f32))
+    // 2) indeksowanie bodies
+    let indexed_bodies: Vec<IndexedBlock> = bodies
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, block)| IndexedBlock { idx, block })
         .collect();
 
-    centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    centers
-}
+    // 3) przypinanie notek do najbliższego body "powyżej"
+    let mut attachments: Vec<NoteAttachment> = Vec::new();
+    let mut loose_notes: Vec<BlockBox> = Vec::new();
 
-fn median_f32(mut v: Vec<f32>) -> f32 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    v[v.len() / 2]
-}
+    for note in notes {
+        let mut best: Option<(usize, f32)> = None; // (body_idx, gap)
 
-==
-pub fn detect_table_regions(blocks_sorted_by_y: &[BlockBox]) -> Vec<TableRegion> {
-    if blocks_sorted_by_y.len() < 6 {
-        return Vec::new();
-    }
-
-    // strojenie
-    let band_h: f32 = 22.0;              // grupowanie po Y
-    let x_cluster_tol: f32 = 16.0;       // klastrowanie xMin w kolumny
-    let min_bands_in_region: usize = 3;  // ile pasm żeby uznać region tabeli
-    let min_cols: usize = 2;
-
-    // scalanie kontynuacji regionów
-    let continuation_y_gap: f32 = 34.0;
-    let col_sim_tol: f32 = 26.0;
-
-    // 1) bandy po center_y
-    use std::collections::BTreeMap;
-    let mut bands: BTreeMap<i64, Vec<&BlockBox>> = BTreeMap::new();
-    for b in blocks_sorted_by_y {
-        let cy = (b.y_min + b.y_max) * 0.5;
-        let k = (cy / band_h).round() as i64;
-        bands.entry(k).or_default().push(b);
-    }
-
-    #[derive(Clone)]
-    struct BandFeat {
-        k: i64,
-        y1: f32,
-        y2: f32,
-        col_x: Vec<f32>,
-        filled_cols: usize,
-        shortish_ratio: f32,
-    }
-
-    let mut feats: Vec<BandFeat> = Vec::new();
-
-    for (&k, v) in &bands {
-        // bierz tylko tekstowe bloki
-        let mut xs: Vec<f32> = Vec::new();
-        let mut y1 = f32::INFINITY;
-        let mut y2 = f32::NEG_INFINITY;
-
-        let mut lens: Vec<usize> = Vec::new();
-        for b in v {
-            let t = block_text_norm(b);
-            let tl = t.trim().len();
-            if tl == 0 {
-                continue;
-            }
-            xs.push(b.x_min);
-            lens.push(tl);
-            y1 = y1.min(b.y_min);
-            y2 = y2.max(b.y_max);
-        }
-
-        // wiersz tabeli 2-kolumnowej może mieć 2 bloki → nie filtruj na >=4
-        if xs.len() < 2 {
-            continue;
-        }
-
-        let mut col_x = cluster_xmins(xs, x_cluster_tol);
-        col_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if col_x.len() < min_cols {
-            continue;
-        }
-
-        // policz ile kolumn faktycznie “wypełnionych”
-        let mut counts = vec![0usize; col_x.len()];
-        for b in v {
-            let t = block_text_norm(b);
-            if t.trim().is_empty() {
-                continue;
-            }
-            let mut best_i = 0usize;
-            let mut best_d = f32::INFINITY;
-            for (i, cx) in col_x.iter().enumerate() {
-                let d = (b.x_min - *cx).abs();
-                if d < best_d {
-                    best_d = d;
-                    best_i = i;
+        for ib in &indexed_bodies {
+            if ib.block.y_min <= note.y_min {
+                let gap = (note.y_min - ib.block.y_max).max(0.0);
+                if gap <= attach_max_gap_px {
+                    match best {
+                        None => best = Some((ib.idx, gap)),
+                        Some((_, best_gap)) => {
+                            if gap < best_gap {
+                                best = Some((ib.idx, gap));
+                            }
+                        }
+                    }
                 }
             }
-            if best_d <= 52.0 {
-                counts[best_i] += 1;
-            }
-        }
-        let filled_cols = counts.iter().filter(|c| **c > 0).count();
-        if filled_cols < 2 {
-            continue;
         }
 
-        // krótkie komórki (typowe w tabelach) – ratio
-        let shortish = lens.iter().filter(|l| **l <= 90).count();
-        let shortish_ratio = shortish as f32 / lens.len().max(1) as f32;
-
-        feats.push(BandFeat {
-            k,
-            y1: if y1.is_finite() { y1 } else { (k as f32 - 0.5) * band_h },
-            y2: if y2.is_finite() { y2 } else { (k as f32 + 0.5) * band_h },
-            col_x,
-            filled_cols,
-            shortish_ratio,
-        });
-    }
-
-    if feats.is_empty() {
-        return Vec::new();
-    }
-    feats.sort_by(|a, b| a.k.cmp(&b.k));
-
-    // 2) wybierz “dobre” bandy: 2+ kolumny + trochę krótkich treści
-    let mut good_keys: Vec<i64> = Vec::new();
-    for f in &feats {
-        if f.filled_cols >= 2 && f.shortish_ratio >= 0.20 {
-            good_keys.push(f.k);
-        }
-    }
-    if good_keys.is_empty() {
-        return Vec::new();
-    }
-
-    good_keys.sort();
-    let mut raw_regions: Vec<(i64, i64)> = Vec::new();
-    let mut sk = good_keys[0];
-    let mut pk = good_keys[0];
-    for &k in good_keys.iter().skip(1) {
-        if k == pk + 1 {
-            pk = k;
+        if let Some((body_idx, _gap)) = best {
+            attachments.push(NoteAttachment { body_idx, note });
         } else {
-            raw_regions.push((sk, pk));
-            sk = k;
-            pk = k;
-        }
-    }
-    raw_regions.push((sk, pk));
-
-    // map k->feat
-    let mut map = std::collections::HashMap::new();
-    for f in feats {
-        map.insert(f.k, f);
-    }
-
-    // 3) zbuduj TableRegion z raw_regions
-    let mut regions: Vec<TableRegion> = Vec::new();
-
-    for (sk, ek) in raw_regions {
-        let band_cnt = (ek - sk + 1) as usize;
-        if band_cnt < min_bands_in_region {
-            continue;
-        }
-
-        let mut y1 = f32::INFINITY;
-        let mut y2 = f32::NEG_INFINITY;
-        let mut xs: Vec<f32> = Vec::new();
-
-        for k in sk..=ek {
-            if let Some(f) = map.get(&k) {
-                y1 = y1.min(f.y1);
-                y2 = y2.max(f.y2);
-                xs.extend(f.col_x.iter().copied());
-            }
-        }
-
-        if !y1.is_finite() || !y2.is_finite() {
-            continue;
-        }
-
-        // stabilizacja kolumn regionu: weź 2 najsilniejsze klastry
-        let mut cols = cluster_xmins(xs, x_cluster_tol);
-        cols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        // policz support i wybierz 2
-        let mut support: Vec<(f32, usize)> = cols
-            .iter()
-            .map(|cx| {
-                let c = blocks_sorted_by_y
-                    .iter()
-                    .filter(|b| !(b.y_max < y1 || b.y_min > y2))
-                    .filter(|b| !block_text_norm(b).trim().is_empty())
-                    .filter(|b| (b.x_min - *cx).abs() <= 52.0)
-                    .count();
-                (*cx, c)
-            })
-            .collect();
-
-        support.sort_by(|a, b| b.1.cmp(&a.1));
-        support.truncate(2);
-        let mut col_x: Vec<f32> = support.into_iter().map(|(x, _)| x).collect();
-        col_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        if col_x.len() < 2 {
-            continue;
-        }
-
-        regions.push(TableRegion { y1: y1 - 12.0, y2: y2 + 12.0, col_x });
-    }
-
-    if regions.is_empty() {
-        return Vec::new();
-    }
-
-    // 4) scal kontynuacje (żeby tabela PKO nie pękała)
-    regions.sort_by(|a, b| a.y1.partial_cmp(&b.y1).unwrap_or(std::cmp::Ordering::Equal));
-
-    fn cols_similar(a: &[f32], b: &[f32], tol: f32) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        for i in 0..a.len() {
-            if (a[i] - b[i]).abs() > tol {
-                return false;
-            }
-        }
-        true
-    }
-
-    let mut merged: Vec<TableRegion> = Vec::new();
-    for r in regions {
-        if let Some(last) = merged.last_mut() {
-            let gap = r.y1 - last.y2;
-            if gap <= continuation_y_gap && cols_similar(&last.col_x, &r.col_x, col_sim_tol) {
-                last.y2 = last.y2.max(r.y2);
-            } else {
-                merged.push(r);
-            }
-        } else {
-            merged.push(r);
+            loose_notes.push(note);
         }
     }
 
-    merged
-}
-
-
-==
-
-pub fn mark_table_blocks(blocks_sorted_by_y: &[BlockBox], regions: &[TableRegion]) -> Vec<bool> {
-    let mut mask = vec![false; blocks_sorted_by_y.len()];
-    if regions.is_empty() {
-        return mask;
-    }
-
-    // kluczowy parametr: zwiększamy tolerancję X
-    let x_assign_tol: f32 = 78.0;
-
-    for (i, b) in blocks_sorted_by_y.iter().enumerate() {
-        let txt = block_text_norm(b);
-        if txt.trim().is_empty() {
-            continue;
-        }
-
-        for r in regions {
-            if b.y_max < r.y1 || b.y_min > r.y2 {
-                continue;
-            }
-
-            // col distance
-            let mut best = f32::INFINITY;
-            for cx in &r.col_x {
-                best = best.min((b.x_min - *cx).abs());
-            }
-
-            // dodatkowy “ratunek”: jeśli block jest szeroki i mieści się między kolumnami, też go zalicz
-            let b_w = (b.x_max - b.x_min).max(0.0);
-            let inside_span = {
-                let left = r.col_x.first().copied().unwrap_or(0.0) - 20.0;
-                let right = r.col_x.last().copied().unwrap_or(0.0) + 320.0;
-                b.x_min >= left && b.x_min <= right && b_w <= 520.0
-            };
-
-            if best <= x_assign_tol || inside_span {
-                mask[i] = true;
-                break;
-            }
-        }
-    }
-
-    mask
-}
-
-
-==
-
-pub fn render_table_region_to_md(blocks_sorted_by_y: &[BlockBox], region: &TableRegion) -> String {
-    if region.col_x.len() < 2 {
-        return String::new();
-    }
-
-    // 1) wybierz bloki w regionie + tekstowe
-    let mut items: Vec<(usize, &BlockBox, String)> = Vec::new();
-    for (idx, b) in blocks_sorted_by_y.iter().enumerate() {
-        if b.y_max < region.y1 || b.y_min > region.y2 {
-            continue;
-        }
-        let t = block_text_norm(b);
-        if t.trim().is_empty() {
-            continue;
-        }
-        items.push((idx, b, t));
-    }
-    if items.is_empty() {
-        return String::new();
-    }
-
-    // 2) oszacuj median height i ustaw gap dla nowych wierszy
-    let h_med = median_f32(items.iter().map(|(_, b, _)| (b.y_max - b.y_min).max(1.0)).collect());
-    let row_gap_tol = (h_med * 0.65).max(7.0).min(18.0);
-
-    fn nearest_col(x: f32, cols: &[f32]) -> usize {
-        let mut best_i = 0usize;
-        let mut best_d = f32::INFINITY;
-        for (i, cx) in cols.iter().enumerate() {
-            let d = (x - *cx).abs();
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
-        }
-        best_i
-    }
-
-    // 3) sort po Y, potem X
-    items.sort_by(|a, b| {
-        a.1.y_min
-            .partial_cmp(&b.1.y_min)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.x_min.partial_cmp(&b.1.x_min).unwrap_or(std::cmp::Ordering::Equal))
+    // stabilność: jeśli wiele notek do jednego body, sort po y_min
+    attachments.sort_by(|a, b| {
+        a.body_idx
+            .cmp(&b.body_idx)
+            .then_with(|| a.note.y_min.partial_cmp(&b.note.y_min).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    // 4) buduj wiersze jako “spany”
-    #[derive(Clone)]
-    struct RowAcc {
-        y1: f32,
-        y2: f32,
-        cols: Vec<Vec<String>>, // per col: list of parts
-    }
-
-    let col_n = region.col_x.len();
-    let mut rows: Vec<RowAcc> = Vec::new();
-
-    for (_idx, b, txt) in items {
-        let ci = nearest_col(b.x_min, &region.col_x);
-
-        if rows.is_empty() {
-            let mut cols = vec![Vec::<String>::new(); col_n];
-            cols[ci].push(txt);
-            rows.push(RowAcc { y1: b.y_min, y2: b.y_max, cols });
-            continue;
-        }
-
-        let last = rows.last_mut().unwrap();
-
-        // kryterium: czy to dalej ten sam wiersz?
-        let gap = b.y_min - last.y2;
-        let overlaps = b.y_min <= last.y2 && b.y_max >= last.y1;
-        let same_row = overlaps || gap <= row_gap_tol;
-
-        if same_row {
-            last.y1 = last.y1.min(b.y_min);
-            last.y2 = last.y2.max(b.y_max);
-            last.cols[ci].push(txt);
-        } else {
-            let mut cols = vec![Vec::<String>::new(); col_n];
-            cols[ci].push(txt);
-            rows.push(RowAcc { y1: b.y_min, y2: b.y_max, cols });
-        }
-    }
-
-    // 5) zbuduj row -> Vec<String>
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-    for r in rows {
-        let row = r
-            .cols
-            .into_iter()
-            .map(|parts| normalize_ws(&parts.join(" ")))
-            .collect::<Vec<_>>();
-        if row.iter().all(|c| c.trim().is_empty()) {
-            continue;
-        }
-        table_rows.push(row);
-    }
-
-    if table_rows.is_empty() {
-        return String::new();
-    }
-
-    // 6) header: jeśli pierwszy wiersz wygląda na nagłówek (krótki + caps), to go użyj,
-    // inaczej pusty (bez “Kolumna 1” śmieci)
-    fn is_header_like(row: &[String]) -> bool {
-        let joined = row.join(" ");
-        let s = joined.trim();
-        if s.len() < 4 || s.len() > 90 {
-            return false;
-        }
-        let letters = s.chars().filter(|c| c.is_alphabetic()).count().max(1);
-        let upp = s.chars().filter(|c| c.is_alphabetic() && c.is_uppercase()).count();
-        let upper_ratio = upp as f32 / letters as f32;
-        upper_ratio >= 0.55
-    }
-
-    let has_header = is_header_like(&table_rows[0]);
-    let (header, data_rows) = if has_header {
-        (table_rows[0].clone(), table_rows.into_iter().skip(1).collect::<Vec<_>>())
-    } else {
-        (vec![String::new(); col_n], table_rows)
-    };
-
-    // 7) emit markdown table
-    let mut out = String::new();
-
-    out.push('|');
-    for c in &header {
-        out.push(' ');
-        out.push_str(&escape_md_cell(c.trim()));
-        out.push(' ');
-        out.push('|');
-    }
-    out.push('\n');
-
-    out.push('|');
-    for _ in 0..col_n {
-        out.push_str(" --- |");
-    }
-    out.push('\n');
-
-    for mut r in data_rows {
-        if r.len() < col_n {
-            r.resize(col_n, String::new());
-        } else if r.len() > col_n {
-            r.truncate(col_n);
-        }
-
-        out.push('|');
-        for c in &r {
-            out.push(' ');
-            out.push_str(&escape_md_cell(c.trim()));
-            out.push(' ');
-            out.push('|');
-        }
-        out.push('\n');
-    }
-
-    out.push('\n');
-    out
-}
-
-
-==
-
-==
-
-fn render_block_lines_to_md(lines: &[LineBox]) -> String {
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    let paragraph_gap: f32 = 10.0;
-
-    // listy
-    let indent_step_px: f32 = 22.0;
-    let continuation_gap_px: f32 = 10.0;
-    let continuation_indent_px: f32 = 28.0;
-    let orphan_merge_gap_px: f32 = 12.0;
-
-    // body_left lokalnie
-    let mut body_left = f32::INFINITY;
-    for l in lines {
-        let t = line_to_text(l);
-        if t.len() >= 24 {
-            body_left = body_left.min(l.x_min);
-        }
-    }
-    if !body_left.is_finite() {
-        body_left = lines.first().map(|l| l.x_min).unwrap_or(0.0);
-    }
-
-    // body_width ~ mediana
-    let mut widths: Vec<f32> = lines
-        .iter()
-        .map(|l| (l.x_max - body_left).max(0.0))
-        .collect();
-    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let body_width = widths.get(widths.len() / 2).copied().unwrap_or(520.0);
-
-    // pre-pass orphan markers
-    let merged_lines = merge_orphan_list_markers(lines, orphan_merge_gap_px);
-
-    // heading helper
-    fn looks_like_heading_text(s: &str) -> bool {
-        let t = s.trim();
-        if t.len() < 4 || t.len() > 80 {
-            return false;
-        }
-        if t.ends_with('.') {
-            return false;
-        }
-        // nie nagłówek jeśli zaczyna się od numeracji typu "1." / "1)"
-        let first = t.split_whitespace().next().unwrap_or("");
-        let numish = first.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ')' || c == '(');
-        if numish {
-            return false;
-        }
-
-        let letters = t.chars().filter(|c| c.is_alphabetic()).count().max(1);
-        let upp = t.chars().filter(|c| c.is_alphabetic() && c.is_uppercase()).count();
-        let upper_ratio = upp as f32 / letters as f32;
-
-        // caps albo “prawie caps”
-        upper_ratio >= 0.55
-    }
-
-    let mut out = String::new();
-
-    // list state
-    let mut in_list = false;
-    let mut list_base_content_x: f32 = 0.0;
-    let mut last_item_content_x: f32 = 0.0;
-    let mut last_level: usize = 0;
-
-    for i in 0..merged_lines.len() {
-        let line = &merged_lines[i];
-        let text = line_to_text(line);
-        if text.is_empty() {
-            continue;
-        }
-
-        let prev_gap = if i == 0 { 999.0 } else { (line.y_min - merged_lines[i - 1].y_max).abs() };
-        let next_gap = if i + 1 >= merged_lines.len() { 999.0 } else { (merged_lines[i + 1].y_min - line.y_max).abs() };
-
-        if line.block_break_before {
-            if in_list {
-                out.push_str("\n\n");
-                in_list = false;
-            } else if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push_str("\n\n");
-            }
-        }
-
-        // heading (zaostrzone)
-        if !is_standalone_listish_line(line) {
-            let line_w = (line.x_max - line.x_min).max(0.0);
-            let short_line = line_w < body_width * 0.78;
-            let centeredish = (line.x_min - body_left).abs() <= 6.0;
-            let separated = prev_gap >= 14.0 && next_gap >= 14.0;
-
-            if centeredish && separated && short_line && looks_like_heading_text(&text) {
-                if in_list {
-                    out.push_str("\n\n");
-                    in_list = false;
-                } else if !out.is_empty() && !out.ends_with("\n\n") {
-                    out.push_str("\n\n");
-                }
-
-                let level = if line_w < body_width * 0.50 { "##" } else { "###" };
-                out.push_str(level);
-                out.push(' ');
-                out.push_str(text.trim());
-                out.push_str("\n\n");
-                continue;
-            }
-        }
-
-        // list item
-        if let Some(marker) = parse_list_marker(line) {
-            let item_content_x = content_x_min_after_marker(line, marker.consume_words);
-
-            if !in_list {
-                if !out.is_empty() && !out.ends_with("\n\n") {
-                    out.push_str("\n\n");
-                }
-                in_list = true;
-                list_base_content_x = item_content_x;
-                last_level = 0;
-            }
-
-            let raw = ((item_content_x - list_base_content_x) / indent_step_px).round();
-            let level = raw.max(0.0) as usize;
-
-            last_level = level;
-            last_item_content_x = item_content_x;
-
-            for _ in 0..level {
-                out.push_str("  ");
-            }
-
-            match marker.kind {
-                ListKind::Ordered => out.push_str("1. "),
-                ListKind::Unordered => out.push_str("- "),
-            }
-
-            let item_text = line.words.iter().skip(marker.consume_words).map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
-            out.push_str(item_text.trim());
-            continue;
-        }
-
-        // list continuation
-        if in_list {
-            let is_close_vertically = prev_gap < continuation_gap_px;
-            let content_x = line.words.first().map(|w| w.x_min).unwrap_or(line.x_min);
-
-            let likely_continuation = is_close_vertically
-                && content_x >= last_item_content_x - 6.0
-                && content_x <= last_item_content_x + continuation_indent_px;
-
-            if likely_continuation {
-                out.push('\n');
-                for _ in 0..last_level {
-                    out.push_str("  ");
-                }
-                out.push_str("   ");
-                out.push_str(text.trim());
-                continue;
-            }
-
-            out.push_str("\n\n");
-            in_list = false;
-        }
-
-        // normal paragraphs
-        if out.is_empty() {
-            out.push_str(text.trim());
-        } else if prev_gap >= paragraph_gap {
-            if !out.ends_with("\n\n") {
-                out.push_str("\n\n");
-            }
-            out.push_str(text.trim());
-        } else {
-            out.push('\n');
-            out.push_str(text.trim());
-        }
-    }
-
-    out.trim_end().to_string()
+    (bodies, attachments, loose_notes)
 }
 
 
@@ -717,7 +111,9 @@ fn render_block_lines_to_md(lines: &[LineBox]) -> String {
 fn render_pages_to_md(pages: Vec<PageBox>) -> String {
     let mut out = String::new();
 
-    let note_indent_px: f32 = 30.0;
+    // UWAGA: zwiększam próg notek minimalnie, żeby “prawa kolumna” nie podpadała łatwo,
+    // ale kluczowe jest wykluczenie tabel w is_note_block.
+    let note_indent_px: f32 = 38.0;
     let attach_max_gap_px: f32 = 90.0;
 
     for (pi, page) in pages.iter().enumerate() {
@@ -729,7 +125,6 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
 
         let table_mask = mark_table_blocks(&blocks, &table_regions);
 
-        // helper: non-table segment render
         let mut render_non_table_segment = |y_from: f32, y_to: f32| -> String {
             let mut seg: Vec<BlockBox> = Vec::new();
             for (i, b) in blocks.iter().enumerate() {
@@ -748,9 +143,6 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
                 return String::new();
             }
 
-            // UWAGA: notki wykrywasz w attach_notes_to_bodies; tu tylko renderujesz segment
-            // (jeśli callouty dalej wchodzą w tekst — w następnym kroku dorobimy stricte “sidebar detection”
-            // na poziomie regionów; ale najpierw stabilizujemy tabele).
             seg.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
 
             // body_left tylko dla segmentu
@@ -758,10 +150,12 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
             xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
 
+            // KLUCZ: przekazujemy table_regions -> notki nie zjedzą tabel
             let (bodies, attachments, loose_notes) =
-                attach_notes_to_bodies(&seg, body_left, note_indent_px, attach_max_gap_px);
+                attach_notes_to_bodies(&seg, body_left, note_indent_px, attach_max_gap_px, &table_regions);
 
-            let mut attached_map: std::collections::BTreeMap<usize, Vec<BlockBox>> = std::collections::BTreeMap::new();
+            let mut attached_map: std::collections::BTreeMap<usize, Vec<BlockBox>> =
+                std::collections::BTreeMap::new();
             for a in attachments {
                 attached_map.entry(a.body_idx).or_default().push(a.note);
             }
@@ -835,7 +229,6 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
             cursor = r.y2;
         }
 
-        // tail
         let tail_md = render_non_table_segment(cursor, f32::INFINITY);
         if !tail_md.trim().is_empty() {
             out.push_str(&tail_md);
@@ -848,3 +241,7 @@ fn render_pages_to_md(pages: Vec<PageBox>) -> String {
 
     out
 }
+
+
+==
+
