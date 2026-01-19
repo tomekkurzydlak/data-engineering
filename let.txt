@@ -1,247 +1,501 @@
-fn is_note_block(
-    block: &BlockBox,
-    body_left: f32,
-    note_indent_px: f32,
-    table_regions: &[TableRegion],
-) -> bool {
-    // 0) jeśli blok w tabeli -> NIGDY note
-    if !table_regions.is_empty() {
-        let cy = (block.y_min + block.y_max) * 0.5;
-        let in_table = table_regions.iter().any(|r| cy >= r.y1 && cy <= r.y2);
-        if in_table {
+pub fn run_pdftotext_bbox(path_str: &str) -> Result<String> {
+    // HYBRYDA: layout jest źródłem prawdy dla tabel i nagłówków
+    let layout_args = &["-layout", path_str, "-"];
+    let layout_txt = run_command_with_args("pdftotext", layout_args)?;
+
+    // bbox-layout tylko jako warstwa pomocnicza (przypisy/superscript + notki fallback)
+    let bbox_args = &["-bbox-layout", path_str, "-"];
+    let xhtml = run_command_with_args("pdftotext", bbox_args)?;
+    let bbox_pages = parse_bbox_layout_pages(&xhtml)?;
+
+    // 1) renderujemy markdown z layout (tabele + nagłówki + tekst)
+    let mut md = render_layout_to_md(&layout_txt);
+
+    // 2) dopinamy przypisy/superscript z bbox (konserwatywnie: tylko blok "Przypisy" na początku każdej strony)
+    //    To jest bezpieczny wariant startowy, który nie rozwali układu.
+    md = inject_bbox_footnotes_into_layout_md(md, &bbox_pages);
+
+    // 3) notki/dymki z bbox jako fallback – TYLKO jeśli layout nie ma wyraźnego calloutu
+    //    (na start: bardzo konserwatywnie: tylko notki, które są "box-like" i nie są częścią tabeli layout)
+    md = inject_bbox_notes_into_layout_md(md, &bbox_pages);
+
+    Ok(md)
+}
+
+==
+#[derive(Debug, Clone)]
+struct LayoutPage {
+    page_no: usize,
+    lines: Vec<String>, // RAW lines with spaces preserved
+}
+
+#[derive(Debug, Clone)]
+struct TableRun {
+    start: usize, // inclusive line index
+    end: usize,   // inclusive
+    col_starts: Vec<usize>, // detected column start positions
+}
+
+/// Podział outputu pdftotext -layout na strony (separator form-feed '\x0C')
+fn split_layout_pages(layout_txt: &str) -> Vec<LayoutPage> {
+    let mut pages: Vec<LayoutPage> = Vec::new();
+    let mut page_no = 0usize;
+
+    for chunk in layout_txt.split('\x0C') {
+        page_no += 1;
+        // zachowujemy puste linie, bo pomagają w odstępach
+        let lines: Vec<String> = chunk
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+
+        pages.push(LayoutPage { page_no, lines });
+    }
+
+    // pdftotext czasem dodaje pustą stronę na końcu
+    while pages.last().map(|p| p.lines.iter().all(|l| l.trim().is_empty())).unwrap_or(false) {
+        pages.pop();
+    }
+
+    pages
+}
+
+/// Czy linia wygląda jak wielokolumnowa (≥2 segmenty rozdzielone dużą przerwą)
+fn detect_column_starts(line: &str) -> Vec<usize> {
+    // Reguła: segmenty rozdzielone >= 3 spacjami.
+    // Zwracamy pozycje startu segmentów.
+    let bytes = line.as_bytes();
+    let mut starts: Vec<usize> = Vec::new();
+
+    // start pierwszego segmentu = pierwsza nie-spacja
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b' ' { i += 1; }
+    if i < bytes.len() {
+        starts.push(i);
+    } else {
+        return starts;
+    }
+
+    // kolejne segmenty: przejście ">=3 spacji + znak"
+    let mut space_run = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            space_run += 1;
+        } else {
+            if space_run >= 3 {
+                // nowy segment startuje tu
+                starts.push(i);
+            }
+            space_run = 0;
+        }
+        i += 1;
+    }
+
+    // dedup i ogranicz (nas interesują tabele 2-3 kolumny)
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+fn is_probably_table_line(line: &str) -> Option<Vec<usize>> {
+    let s = line.trim_end();
+    if s.trim().is_empty() {
+        return None;
+    }
+    let starts = detect_column_starts(s);
+    if starts.len() >= 2 {
+        // dodatkowo: unikamy fałszywych pozytywów typu "A    B" w krótkiej linii
+        if s.len() >= 25 {
+            return Some(starts);
+        }
+    }
+    None
+}
+
+/// Ocena podobieństwa układu kolumn (żeby scalać runy)
+fn col_starts_similar(a: &[usize], b: &[usize]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // tolerancja w znakach monospace
+    let tol: isize = 3;
+    for i in 0..a.len() {
+        if (a[i] as isize - b[i] as isize).abs() > tol {
             return false;
         }
     }
-
-    let indent = block.x_min - body_left;
-
-    // 1) indent musi być wyraźny
-    if indent < note_indent_px {
-        return false;
-    }
-
-    // 2) długość tekstu
-    let txt_len: usize = block
-        .lines
-        .iter()
-        .map(|l| line_to_text(l))
-        .map(|s| s.trim().len())
-        .sum::<usize>();
-
-    // 3) heurystyki notki
-    let few_lines = block.lines.len() <= 6;
-    let not_too_long = txt_len <= 600;
-
-    few_lines && not_too_long
+    true
 }
 
+/// Wykryj runy tabel na stronie (ciąg kolejnych linii wielokolumnowych)
+fn detect_table_runs(lines: &[String]) -> Vec<TableRun> {
+    let min_run_len = 3usize; // co najmniej 3 linie wielokolumnowe
+    let max_blank_gap = 1usize; // pozwalamy na 1 pustą linię w środku
 
-==
+    let mut runs: Vec<TableRun> = Vec::new();
 
-fn attach_notes_to_bodies(
-    blocks_sorted_by_y: &[BlockBox],
-    body_left: f32,
-    note_indent_px: f32,
-    attach_max_gap_px: f32,
-    table_regions: &[TableRegion],
-) -> (Vec<BlockBox>, Vec<NoteAttachment>, Vec<BlockBox>) {
-    // 1) podział na bodies vs notes (notes wyłącznie poza tabelą)
-    let mut bodies: Vec<BlockBox> = Vec::new();
-    let mut notes: Vec<BlockBox> = Vec::new();
+    let mut cur_start: Option<usize> = None;
+    let mut cur_end: usize = 0;
+    let mut cur_cols: Vec<usize> = Vec::new();
+    let mut blank_gap = 0usize;
 
-    for b in blocks_sorted_by_y {
-        if is_note_block(b, body_left, note_indent_px, table_regions) {
-            notes.push(b.clone());
-        } else {
-            bodies.push(b.clone());
-        }
-    }
+    for (idx, line) in lines.iter().enumerate() {
+        let maybe_cols = is_probably_table_line(line);
 
-    // 2) indeksowanie bodies
-    let indexed_bodies: Vec<IndexedBlock> = bodies
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(idx, block)| IndexedBlock { idx, block })
-        .collect();
-
-    // 3) przypinanie notek do najbliższego body "powyżej"
-    let mut attachments: Vec<NoteAttachment> = Vec::new();
-    let mut loose_notes: Vec<BlockBox> = Vec::new();
-
-    for note in notes {
-        let mut best: Option<(usize, f32)> = None; // (body_idx, gap)
-
-        for ib in &indexed_bodies {
-            if ib.block.y_min <= note.y_min {
-                let gap = (note.y_min - ib.block.y_max).max(0.0);
-                if gap <= attach_max_gap_px {
-                    match best {
-                        None => best = Some((ib.idx, gap)),
-                        Some((_, best_gap)) => {
-                            if gap < best_gap {
-                                best = Some((ib.idx, gap));
-                            }
+        match (cur_start, maybe_cols) {
+            (None, Some(cols)) => {
+                cur_start = Some(idx);
+                cur_end = idx;
+                cur_cols = cols;
+                blank_gap = 0;
+            }
+            (Some(_), Some(cols)) => {
+                // kontynuacja runu tylko jeśli podobne kolumny
+                if col_starts_similar(&cur_cols, &cols) {
+                    cur_end = idx;
+                    blank_gap = 0;
+                } else {
+                    // zamknij poprzedni run, otwórz nowy
+                    if let Some(st) = cur_start {
+                        if (cur_end - st + 1) >= min_run_len {
+                            runs.push(TableRun { start: st, end: cur_end, col_starts: cur_cols.clone() });
                         }
                     }
+                    cur_start = Some(idx);
+                    cur_end = idx;
+                    cur_cols = cols;
+                    blank_gap = 0;
                 }
             }
-        }
-
-        if let Some((body_idx, _gap)) = best {
-            attachments.push(NoteAttachment { body_idx, note });
-        } else {
-            loose_notes.push(note);
+            (Some(_), None) => {
+                if line.trim().is_empty() && blank_gap < max_blank_gap {
+                    blank_gap += 1;
+                    // zostawiamy run otwarty
+                } else {
+                    // zamknij run
+                    if let Some(st) = cur_start {
+                        if (cur_end - st + 1) >= min_run_len {
+                            runs.push(TableRun { start: st, end: cur_end, col_starts: cur_cols.clone() });
+                        }
+                    }
+                    cur_start = None;
+                    cur_cols.clear();
+                    blank_gap = 0;
+                }
+            }
+            (None, None) => {}
         }
     }
 
-    // stabilność: jeśli wiele notek do jednego body, sort po y_min
-    attachments.sort_by(|a, b| {
-        a.body_idx
-            .cmp(&b.body_idx)
-            .then_with(|| a.note.y_min.partial_cmp(&b.note.y_min).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    // final flush
+    if let Some(st) = cur_start {
+        if (cur_end - st + 1) >= min_run_len {
+            runs.push(TableRun { start: st, end: cur_end, col_starts: cur_cols.clone() });
+        }
+    }
 
-    (bodies, attachments, loose_notes)
+    runs
 }
 
+/// Podziel linię na komórki wg startów kolumn
+fn split_line_into_cells(line: &str, col_starts: &[usize]) -> Vec<String> {
+    let mut cells: Vec<String> = Vec::new();
+    if col_starts.is_empty() {
+        return cells;
+    }
 
-==
+    let mut starts = col_starts.to_vec();
+    starts.sort_unstable();
+    starts.dedup();
 
-fn render_pages_to_md(pages: Vec<PageBox>) -> String {
+    for (i, &st) in starts.iter().enumerate() {
+        let end = if i + 1 < starts.len() { starts[i + 1] } else { line.len() };
+        let slice = if st < line.len() { &line[st..end.min(line.len())] } else { "" };
+        cells.push(normalize_ws(slice.trim()));
+    }
+
+    // przytnij trailing puste kolumny
+    while cells.last().map(|c| c.trim().is_empty()).unwrap_or(false) {
+        cells.pop();
+    }
+    cells
+}
+
+/// Render tabeli jako markdown (pipe). Jeśli wolisz, łatwo zamienisz to na code fence.
+fn render_table_run_to_md(lines: &[String], run: &TableRun) -> String {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    for i in run.start..=run.end {
+        let line = lines.get(i).map(|s| s.as_str()).unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cells = split_line_into_cells(line, &run.col_starts);
+        if cells.len() >= 2 && cells.iter().any(|c| !c.trim().is_empty()) {
+            rows.push(cells);
+        }
+    }
+
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // ustal liczbę kolumn = max
+    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(2);
+    for r in rows.iter_mut() {
+        while r.len() < col_count { r.push(String::new()); }
+        if r.len() > col_count { r.truncate(col_count); }
+    }
+
+    // header heurystycznie: pierwsza linia jeśli wygląda jak nagłówki
+    let has_header = looks_like_header_row(&rows[0]);
+    let header = if has_header { rows.remove(0) } else { vec![String::new(); col_count] };
+
+    let mut out = String::new();
+    out.push('|');
+    for c in &header {
+        out.push(' ');
+        out.push_str(&escape_md_cell(c.trim()));
+        out.push(' ');
+        out.push('|');
+    }
+    out.push('\n');
+
+    out.push('|');
+    for _ in 0..col_count {
+        out.push_str(" --- |");
+    }
+    out.push('\n');
+
+    for r in &rows {
+        out.push('|');
+        for c in r {
+            out.push(' ');
+            out.push_str(&escape_md_cell(c.trim()));
+            out.push(' ');
+            out.push('|');
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// Prosta heurystyka nagłówka z layout: krótkie, uppercase-ish, separowane pustymi liniami
+fn is_layout_heading(line: &str, prev_blank: bool, next_blank: bool) -> Option<&'static str> {
+    let t = line.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.len() > 120 {
+        return None;
+    }
+
+    // nie rób nagłówków z samych cyfr
+    if t.len() <= 3 && t.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+    let uppers = t.chars().filter(|c| c.is_uppercase()).count();
+    let upper_ratio = if letters > 0 { uppers as f32 / letters as f32 } else { 0.0 };
+
+    let separated = prev_blank && next_blank;
+    let short = t.len() <= 80;
+
+    if separated && short && upper_ratio >= 0.55 {
+        // mocny nagłówek
+        return Some("##");
+    }
+    if separated && t.len() <= 110 && upper_ratio >= 0.40 {
+        return Some("###");
+    }
+
+    None
+}
+
+/// Główny renderer layout -> Markdown (tabele + nagłówki + tekst)
+pub fn render_layout_to_md(layout_txt: &str) -> String {
+    let pages = split_layout_pages(layout_txt);
     let mut out = String::new();
 
-    // UWAGA: zwiększam próg notek minimalnie, żeby “prawa kolumna” nie podpadała łatwo,
-    // ale kluczowe jest wykluczenie tabel w is_note_block.
-    let note_indent_px: f32 = 38.0;
-    let attach_max_gap_px: f32 = 90.0;
+    for (pi, p) in pages.iter().enumerate() {
+        let runs = detect_table_runs(&p.lines);
 
-    for (pi, page) in pages.iter().enumerate() {
-        let mut blocks = page.blocks.clone();
-        blocks.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut table_regions = detect_table_regions(&blocks);
-        table_regions.sort_by(|a, b| a.y1.partial_cmp(&b.y1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let table_mask = mark_table_blocks(&blocks, &table_regions);
-
-        let mut render_non_table_segment = |y_from: f32, y_to: f32| -> String {
-            let mut seg: Vec<BlockBox> = Vec::new();
-            for (i, b) in blocks.iter().enumerate() {
-                if table_mask[i] {
-                    continue;
-                }
-                if b.y_max <= y_from {
-                    continue;
-                }
-                if b.y_min >= y_to {
-                    continue;
-                }
-                seg.push(b.clone());
-            }
-            if seg.is_empty() {
-                return String::new();
-            }
-
-            seg.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-
-            // body_left tylko dla segmentu
-            let mut xmins: Vec<f32> = seg.iter().map(|b| b.x_min).collect();
-            xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
-
-            // KLUCZ: przekazujemy table_regions -> notki nie zjedzą tabel
-            let (bodies, attachments, loose_notes) =
-                attach_notes_to_bodies(&seg, body_left, note_indent_px, attach_max_gap_px, &table_regions);
-
-            let mut attached_map: std::collections::BTreeMap<usize, Vec<BlockBox>> =
-                std::collections::BTreeMap::new();
-            for a in attachments {
-                attached_map.entry(a.body_idx).or_default().push(a.note);
-            }
-
-            let mut o = String::new();
-            for (bi, body) in bodies.iter().enumerate() {
-                if body.lines.is_empty() {
-                    continue;
-                }
-                let mut lines = body.lines.clone();
-                lines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-                let body_txt = render_block_lines_to_md(&lines);
-                if !body_txt.trim().is_empty() {
-                    o.push_str(body_txt.trim());
-                    o.push_str("\n\n");
-                }
-
-                if let Some(notes_for_body) = attached_map.get(&bi) {
-                    for note in notes_for_body {
-                        if note.lines.is_empty() {
-                            continue;
-                        }
-                        let mut nlines = note.lines.clone();
-                        nlines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-                        let note_txt = render_note_block_as_callout(&nlines);
-                        if !note_txt.trim().is_empty() {
-                            o.push_str(&note_txt);
-                        }
-                    }
+        // mapa linii należących do tabel
+        let mut table_line = vec![false; p.lines.len()];
+        for r in &runs {
+            for i in r.start..=r.end {
+                if i < table_line.len() {
+                    table_line[i] = true;
                 }
             }
-
-            if !loose_notes.is_empty() {
-                o.push('\n');
-                for note in loose_notes {
-                    if note.lines.is_empty() {
-                        continue;
-                    }
-                    let mut nlines = note.lines.clone();
-                    nlines.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-                    let note_txt = render_note_block_as_callout(&nlines);
-                    if !note_txt.trim().is_empty() {
-                        o.push_str(&note_txt);
-                    }
-                }
-                o.push('\n');
-            }
-
-            o
-        };
-
-        // interleaving
-        let mut cursor = f32::NEG_INFINITY;
-        for r in &table_regions {
-            let seg_md = render_non_table_segment(cursor, r.y1);
-            if !seg_md.trim().is_empty() {
-                out.push_str(&seg_md);
-                if !out.ends_with("\n\n") {
-                    out.push_str("\n\n");
-                }
-            }
-
-            let tmd = render_table_region_to_md(&blocks, r);
-            if !tmd.trim().is_empty() {
-                out.push_str(&tmd);
-                if !out.ends_with("\n\n") {
-                    out.push_str("\n\n");
-                }
-            }
-
-            cursor = r.y2;
         }
 
-        let tail_md = render_non_table_segment(cursor, f32::INFINITY);
-        if !tail_md.trim().is_empty() {
-            out.push_str(&tail_md);
+        let mut i = 0usize;
+        while i < p.lines.len() {
+            // jeśli start runu tabeli
+            if let Some(run) = runs.iter().find(|r| r.start == i) {
+                let tmd = render_table_run_to_md(&p.lines, run);
+                if !tmd.trim().is_empty() {
+                    if !out.ends_with("\n\n") && !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str(&tmd);
+                }
+                i = run.end + 1;
+                continue;
+            }
+
+            // jeśli linia w tabeli (środek runu) - pomijamy
+            if table_line.get(i).copied().unwrap_or(false) {
+                i += 1;
+                continue;
+            }
+
+            let line = p.lines[i].as_str();
+            let prev_blank = if i == 0 { true } else { p.lines[i - 1].trim().is_empty() };
+            let next_blank = if i + 1 >= p.lines.len() { true } else { p.lines[i + 1].trim().is_empty() };
+
+            if let Some(level) = is_layout_heading(line, prev_blank, next_blank) {
+                if !out.ends_with("\n\n") && !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(level);
+                out.push(' ');
+                out.push_str(line.trim());
+                out.push_str("\n\n");
+                i += 1;
+                continue;
+            }
+
+            // normalny tekst: zachowuj paragrafy po pustych liniach
+            if line.trim().is_empty() {
+                // separator akapitu
+                if !out.ends_with("\n\n") && !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                i += 1;
+                continue;
+            }
+
+            // dopisz linię jako tekst (normalizujemy whitespace, ale NIE tracimy struktury tabel, bo te linie zostały skonsumowane)
+            if out.is_empty() || out.ends_with("\n\n") {
+                out.push_str(line.trim());
+            } else {
+                out.push('\n');
+                out.push_str(line.trim());
+            }
+
+            i += 1;
         }
 
         if pi + 1 < pages.len() {
-            out.push_str("\n---\n\n");
+            out.push_str("\n\n---\n\n");
         }
     }
 
+    out.trim_end().to_string()
+}
+
+==
+
+fn inject_bbox_footnotes_into_layout_md(mut md: String, bbox_pages: &[PageBox]) -> String {
+    // Strategia: na początku każdej strony (tuż po separatorze --- lub na początku)
+    // dodajemy blok "*Przypisy:* ..." jeśli coś wykryliśmy.
+    //
+    // To jest startowy, bezpieczny wariant. Później można to wiązać z miejscami w tekście.
+    let mut inserts: Vec<(usize, String)> = Vec::new(); // (byte_pos, insert)
+
+    // znajdź pozycje startów stron w MD
+    let mut page_starts: Vec<usize> = vec![0];
+    let mut idx = 0usize;
+    while let Some(pos) = md[idx..].find("\n---\n") {
+        let sep_pos = idx + pos;
+        // start kolejnej strony to tuż po separatorze
+        let next_start = sep_pos + "\n---\n".len();
+        page_starts.push(next_start);
+        idx = next_start;
+    }
+
+    for (pi, page) in bbox_pages.iter().enumerate() {
+        let notes = extract_superscripts_from_bbox_page(page);
+        if notes.is_empty() {
+            continue;
+        }
+
+        let mut block = String::new();
+        block.push_str("\n\n**Przypisy (bbox):**\n");
+        for n in notes {
+            block.push_str("- ");
+            block.push_str(&n);
+            block.push('\n');
+        }
+        block.push('\n');
+
+        if let Some(&start) = page_starts.get(pi) {
+            inserts.push((start, block));
+        }
+    }
+
+    // wstawiamy od końca żeby nie przesuwać indeksów
+    inserts.sort_by(|a, b| b.0.cmp(&a.0));
+    for (pos, ins) in inserts {
+        if pos <= md.len() {
+            md.insert_str(pos, &ins);
+        }
+    }
+
+    md
+}
+
+fn extract_superscripts_from_bbox_page(page: &PageBox) -> Vec<String> {
+    // Heurystyka: w obrębie jednej linii (LineBox) wykryj słowa "mniejsze i wyżej" niż mediana.
+    // Ponieważ nie mamy font-size, używamy wysokości bbox: (y_max - y_min).
+    //
+    // Zwracamy listę krótkich tokenów typu "1", "2", "*" znalezionych jako superscript.
+    let mut out: Vec<String> = Vec::new();
+
+    for b in &page.blocks {
+        for l in &b.lines {
+            if l.words.len() < 2 {
+                continue;
+            }
+
+            let mut heights: Vec<f32> = l.words.iter().map(|w| (w.y_max - w.y_min).max(0.0)).collect();
+            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med_h = heights.get(heights.len() / 2).copied().unwrap_or(0.0);
+
+            let mut ymins: Vec<f32> = l.words.iter().map(|w| w.y_min).collect();
+            ymins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med_y = ymins.get(ymins.len() / 2).copied().unwrap_or(0.0);
+
+            for w in &l.words {
+                let h = (w.y_max - w.y_min).max(0.0);
+                let is_small = med_h > 0.0 && h < med_h * 0.75;
+                let is_higher = w.y_min + 0.5 < med_y; // wyżej na stronie (mniejszy y_min)
+                let t = w.text.trim();
+
+                let looks_like_marker = (t.len() <= 3 && t.chars().all(|c| c.is_ascii_digit()))
+                    || matches!(t, "*" | "•" | "†" | "‡");
+
+                if is_small && is_higher && looks_like_marker {
+                    out.push(t.to_string());
+                }
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
     out
 }
 
 
 ==
 
+fn inject_bbox_notes_into_layout_md(md: String, _bbox_pages: &[PageBox]) -> String {
+    // Na tym etapie: NIE wstrzykujemy notek automatycznie, bo to najłatwiej psuje layout.
+    // Zostawiamy hook. Kolejny krok: wykrywanie "box-like" notek i wpinanie ich po najbliższym akapicie.
+    md
+}
