@@ -16,14 +16,21 @@ fn is_note_block(
         return false;
     }
 
-    // 3) dodatkowy bezpiecznik: notki zwykle są "krótkie" i nie mają wielu linii
-    // (w razie potrzeby poluzuj)
-    let txt_len = block_text(block).len();
+    // 3) policz długość tekstu jawnie jako usize
+    let txt_len: usize = block
+        .lines
+        .iter()
+        .map(|l| line_to_text(l))        // String
+        .map(|s| s.trim().len())         // usize
+        .sum::<usize>();                 // <<< KLUCZOWE
+
+    // 4) heurystyki notki
     let few_lines = block.lines.len() <= 6;
     let not_too_long = txt_len <= 600;
 
     few_lines && not_too_long
 }
+
 
 fn attach_notes_to_bodies(
     blocks_sorted_by_y: &[BlockBox],
