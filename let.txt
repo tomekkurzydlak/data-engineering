@@ -513,38 +513,149 @@ pub fn render_table_region_to_md(
 
 ==
 
-wpiecie
+fn render_pages_to_md(pages: Vec<PageBox>) -> String {
+    let mut out = String::new();
 
-// 1) wykryj tabelki
-let table_regions = detect_table_regions(&blocks);
+    // strojenie notek
+    let note_indent_px: f32 = 30.0;
+    let attach_max_gap_px: f32 = 90.0;
 
-// 2) wyrenderuj tabelki i zbierz bloki NIE-tabelowe
-let mut non_table_blocks: Vec<BlockBox> = Vec::new();
+    for (pi, page) in pages.iter().enumerate() {
+        // --------------------------------------------------
+        // 0) sort bloków strony po Y
+        // --------------------------------------------------
+        let mut blocks = page.blocks.clone();
+        blocks.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
 
-for b in &blocks {
-    let cy = (b.y_min + b.y_max) * 0.5;
-    let in_table = table_regions.iter().any(|r| cy >= r.y1 && cy <= r.y2);
-    if !in_table {
-        non_table_blocks.push(b.clone());
+        // --------------------------------------------------
+        // 1) WYKRYCIE REGIONÓW TABEL
+        // --------------------------------------------------
+        let table_regions = detect_table_regions(&blocks);
+
+        // --------------------------------------------------
+        // 2) RENDER TABEL + ODFILTROWANIE BLOKÓW TABELARYCZNYCH
+        // --------------------------------------------------
+        let mut non_table_blocks: Vec<BlockBox> = Vec::new();
+
+        // render tabel w kolejności Y (naturalny flow strony)
+        for region in &table_regions {
+            let tmd = render_table_region_to_md(&blocks, region);
+            if !tmd.trim().is_empty() {
+                out.push_str(&tmd);
+            }
+        }
+
+        // zachowaj tylko bloki, które NIE należą do tabel
+        for b in &blocks {
+            let cy = (b.y_min + b.y_max) * 0.5;
+            let in_table = table_regions
+                .iter()
+                .any(|r| cy >= r.y1 && cy <= r.y2);
+
+            if !in_table {
+                non_table_blocks.push(b.clone());
+            }
+        }
+
+        // --------------------------------------------------
+        // 3) PRZYGOTOWANIE TEKSTU NIETABELARYCZNEGO
+        // --------------------------------------------------
+        if !non_table_blocks.is_empty() {
+            non_table_blocks.sort_by(|a, b| {
+                a.y_min
+                    .partial_cmp(&b.y_min)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // body_left liczymy WYŁĄCZNIE na blokach nietabelarycznych
+            let mut xmins: Vec<f32> = non_table_blocks.iter().map(|b| b.x_min).collect();
+            xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
+
+            let (bodies, attachments, loose_notes) =
+                attach_notes_to_bodies(&non_table_blocks, body_left, note_indent_px, attach_max_gap_px);
+
+            // mapowanie: body_idx -> notki
+            let mut attached_map: std::collections::BTreeMap<usize, Vec<BlockBox>> =
+                std::collections::BTreeMap::new();
+
+            for a in attachments {
+                attached_map.entry(a.body_idx).or_default().push(a.note);
+            }
+
+            // --------------------------------------------------
+            // 4) RENDER TEKSTU + NOTEK
+            // --------------------------------------------------
+            for (bi, body) in bodies.iter().enumerate() {
+                if body.lines.is_empty() {
+                    continue;
+                }
+
+                let mut lines = body.lines.clone();
+                lines.sort_by(|a, b| {
+                    a.y_min
+                        .partial_cmp(&b.y_min)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let body_txt = render_block_lines_to_md(&lines);
+                if !body_txt.trim().is_empty() {
+                    out.push_str(body_txt.trim());
+                    out.push_str("\n\n");
+                }
+
+                if let Some(notes_for_body) = attached_map.get(&bi) {
+                    for note in notes_for_body {
+                        if note.lines.is_empty() {
+                            continue;
+                        }
+
+                        let mut nlines = note.lines.clone();
+                        nlines.sort_by(|a, b| {
+                            a.y_min
+                                .partial_cmp(&b.y_min)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        let note_txt = render_note_block_as_callout(&nlines);
+                        if !note_txt.trim().is_empty() {
+                            out.push_str(&note_txt);
+                        }
+                    }
+                }
+            }
+
+            // luźne notki (nieprzypięte)
+            if !loose_notes.is_empty() {
+                out.push('\n');
+                for note in loose_notes {
+                    if note.lines.is_empty() {
+                        continue;
+                    }
+
+                    let mut nlines = note.lines.clone();
+                    nlines.sort_by(|a, b| {
+                        a.y_min
+                            .partial_cmp(&b.y_min)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    let note_txt = render_note_block_as_callout(&nlines);
+                    if !note_txt.trim().is_empty() {
+                        out.push_str(&note_txt);
+                    }
+                }
+                out.push('\n');
+            }
+        }
+
+        // --------------------------------------------------
+        // 5) SEPARATOR STRON
+        // --------------------------------------------------
+        if pi + 1 < pages.len() {
+            out.push_str("\n---\n\n");
+        }
     }
+
+    out
 }
-
-// render tabel (w kolejności Y)
-for r in &table_regions {
-    let tmd = render_table_region_to_md(&blocks, r);
-    if !tmd.trim().is_empty() {
-        out.push_str(&tmd);
-    }
-}
-
-// 3) dalej operuj już na non_table_blocks (notki + normalny tekst)
-let mut nt = non_table_blocks;
-nt.sort_by(|a, b| a.y_min.partial_cmp(&b.y_min).unwrap_or(std::cmp::Ordering::Equal));
-
-// body_left licz na NT, nie na tabelach
-let mut xmins: Vec<f32> = nt.iter().map(|b| b.x_min).collect();
-xmins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-let body_left = xmins.get(xmins.len() / 2).copied().unwrap_or(0.0);
-
-let (bodies, attachments, loose_notes) =
-    attach_notes_to_bodies(&nt, body_left, note_indent_px, attach_max_gap_px);
