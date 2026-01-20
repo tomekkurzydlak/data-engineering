@@ -1,0 +1,891 @@
+use pdfium_render::prelude::*;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+
+#[derive(Debug, Clone)]
+struct TextItem {
+    text: String,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    font_size: f32,
+}
+
+
+fn is_footer_line(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() { return false; }
+    let lower = t.to_lowercase();
+
+    // typowe wzorce w stopkach PLAY / dokumentów prawnych
+    lower.contains("p4 sp. z o.o")
+        || lower.contains("krs")
+        || lower.contains("regon")
+        || lower.contains("nip")
+        || lower.contains("kapitał zakładowy")
+        || lower.contains("sąd rejonowy")
+        || lower.contains("strona")
+        || lower.contains("wynalazek 1")
+}
+
+
+fn is_noise_cell(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() { return true; }
+    // pojedyncze znaki które często są artefaktami
+    if t.len() == 1 {
+        let c = t.chars().next().unwrap();
+        return c == '.' || c == '-' || c == '|' || c == ',' || c == '•';
+    }
+    false
+}
+
+fn is_noise_row(cols: &[String]) -> bool {
+    // policz niepuste
+    let non_empty: Vec<&str> = cols.iter()
+        .map(|c| c.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // 0 komórek -> szum
+    if non_empty.is_empty() {
+        return true;
+    }
+
+    // 1 komórka -> prawie zawsze to NIE jest tabela (to są właśnie Twoje "mini tabelki")
+    // wyjątek: można by dopuścić np. wiersze stricte-numeryczne, ale w tych PDF-ach to bardziej szkodzi niż pomaga
+    if non_empty.len() == 1 {
+        return true;
+    }
+
+    // odfiltruj "artefakty"
+    let noisy = cols.iter().filter(|c| is_noise_cell(c)).count();
+
+    // jeśli większość komórek to szum/pusto -> wywal
+    noisy * 2 >= cols.len().max(1)
+}
+
+
+impl TextItem {
+    fn cx(&self) -> f32 {
+        (self.x0 + self.x1) * 0.5
+    }
+    fn cy(&self) -> f32 {
+        (self.y0 + self.y1) * 0.5
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LineSeg {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl LineSeg {
+    fn is_horizontal(&self, tol: f32) -> bool {
+        (self.y0 - self.y1).abs() <= tol && (self.x1 - self.x0).abs() > 15.0
+    }
+    fn is_vertical(&self, tol: f32) -> bool {
+        (self.x0 - self.x1).abs() <= tol && (self.y1 - self.y0).abs() > 15.0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TableGrid {
+    x_lines: Vec<f32>,
+    y_lines: Vec<f32>,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+}
+
+fn approx_dedup_sorted(mut v: Vec<f32>, eps: f32) -> Vec<f32> {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut out: Vec<f32> = Vec::new();
+    for x in v {
+        if out.last().map(|last| (x - *last).abs() > eps).unwrap_or(true) {
+            out.push(x);
+        }
+    }
+    out
+}
+
+fn collect_text_items(page: &PdfPage) -> Vec<TextItem> {
+    let mut out = Vec::new();
+
+    for obj in page.objects().iter() {
+        if let Some(t) = obj.as_text_object() {
+            let s = t.text();
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                continue;
+            }
+
+            if let Ok(b) = t.bounds() {
+                let x0 = b.left().value;
+                let x1 = b.right().value;
+                let y0 = b.bottom().value;
+                let y1 = b.top().value;
+                let font_size = t.scaled_font_size().value;
+
+                out.push(TextItem {
+                    text: s,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    font_size,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+fn collect_line_segs(page: &PdfPage) -> Vec<LineSeg> {
+    let mut out = Vec::new();
+
+    for obj in page.objects().iter() {
+        if let Some(p) = obj.as_path_object() {
+            if let Ok(b) = p.bounds() {
+                let x0 = b.left().value;
+                let x1 = b.right().value;
+                let y0 = b.bottom().value;
+                let y1 = b.top().value;
+
+                let w = (x1 - x0).abs();
+                let h = (y1 - y0).abs();
+
+                if w > 30.0 && h < 3.0 {
+                    out.push(LineSeg { x0, y0: (y0 + y1) * 0.5, x1, y1: (y0 + y1) * 0.5 });
+                } else if h > 20.0 && w < 3.0 {
+                    out.push(LineSeg { x0: (x0 + x1) * 0.5, y0, x1: (x0 + x1) * 0.5, y1 });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn detect_table_grid(line_segs: &[LineSeg]) -> Option<TableGrid> {
+    if line_segs.len() < 4 {
+        return None;
+    }
+
+    let hor_tol = 3.0;
+    let ver_tol = 3.0;
+
+    let horizontals: Vec<&LineSeg> = line_segs.iter().filter(|s| s.is_horizontal(hor_tol)).collect();
+    let verticals: Vec<&LineSeg> = line_segs.iter().filter(|s| s.is_vertical(ver_tol)).collect();
+
+    // Potrzebujemy przynajmniej 3 poziomych (góra, dół + 1 separator) i 1 pionowej
+    if horizontals.len() < 3 || verticals.len() < 1 {
+        return None;
+    }
+
+    // Znajdź główną tabelę - linie o podobnej długości
+    let h_lengths: Vec<f32> = horizontals.iter().map(|s| (s.x1 - s.x0).abs()).collect();
+    let avg_h_len = h_lengths.iter().sum::<f32>() / h_lengths.len() as f32;
+
+    // Filtruj linie poziome - tylko te które są co najmniej 70% średniej długości
+    let h_main: Vec<&LineSeg> = horizontals
+        .iter()
+        .filter(|s| {
+            let len = (s.x1 - s.x0).abs();
+            len >= avg_h_len * 0.7
+        })
+        .copied()
+        .collect();
+
+    if h_main.len() < 3 {
+        return None;
+    }
+
+    // Zbierz pozycje X i Y
+    let mut xs: Vec<f32> = Vec::new();
+    let mut ys: Vec<f32> = Vec::new();
+
+    // Dodaj pionowe linie
+    for v in &verticals {
+        xs.push(v.x0);
+    }
+
+    // Dodaj granice i pozycje z poziomych
+    for h in &h_main {
+        xs.push(h.x0);
+        xs.push(h.x1);
+        ys.push(h.y0);
+    }
+
+    xs = approx_dedup_sorted(xs, 10.0);
+    ys = approx_dedup_sorted(ys, 5.0);
+
+    if xs.len() < 2 || ys.len() < 3 {
+        return None;
+    }
+
+    // Ograniczenie kolumn - max 6 dla typowych tabel
+    if xs.len() > 7 {
+        return None;
+    }
+
+    let min_x = *xs.first().unwrap();
+    let max_x = *xs.last().unwrap();
+    let min_y = *ys.first().unwrap();
+    let max_y = *ys.last().unwrap();
+
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+
+    // Tabela musi mieć sensowny rozmiar
+    if width < 150.0 || height < 60.0 {
+        return None;
+    }
+
+    // Wysokość nie powinna być zbyt duża dla pojedynczej tabeli
+    if height > 500.0 {
+        return None;
+    }
+
+    Some(TableGrid { x_lines: xs, y_lines: ys, min_x, max_x, min_y, max_y })
+}
+
+fn group_text_into_lines(items: &[TextItem], y_band: f32) -> Vec<Vec<TextItem>> {
+    let mut map: BTreeMap<i32, Vec<TextItem>> = BTreeMap::new();
+
+    for it in items {
+        let key = (it.cy() / y_band).round() as i32;
+        map.entry(key).or_default().push(it.clone());
+    }
+
+    let mut lines: Vec<(i32, Vec<TextItem>)> = map.into_iter().collect();
+    lines.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (_, line) in &mut lines {
+        line.sort_by(|a, b| a.x0.partial_cmp(&b.x0).unwrap());
+    }
+
+    lines.into_iter().map(|(_, v)| v).collect()
+}
+
+fn is_inside_table(line: &[TextItem], grid: &TableGrid) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+
+    // Sprawdź czy większość tekstu jest w granicach X tabeli
+    let mut inside_x = 0usize;
+    let mut inside_full = 0usize;
+
+    for it in line {
+        let cx = it.cx();
+        let cy = it.cy();
+
+        // Czy w zakresie X?
+        if cx >= grid.min_x - 5.0 && cx <= grid.max_x + 5.0 {
+            inside_x += 1;
+
+            // Czy też w zakresie Y?
+            if cy >= grid.min_y - 15.0 && cy <= grid.max_y + 15.0 {
+                inside_full += 1;
+            }
+        }
+    }
+
+    // Musi być w X i przynajmniej częściowo w Y
+    inside_x >= ((line.len() as f32) * 0.7) as usize &&
+        inside_full >= ((line.len() as f32) * 0.5) as usize
+}
+
+fn assign_to_columns(line: &[TextItem], grid: &TableGrid) -> Vec<String> {
+    let col_count = grid.x_lines.len().saturating_sub(1);
+    if col_count == 0 {
+        return vec![line.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ")];
+    }
+
+    let mut cols: Vec<Vec<&TextItem>> = vec![Vec::new(); col_count];
+
+    for it in line {
+        let cx = it.cx();
+
+        // Przypisz do kolumny zawierającej punkt
+        let mut assigned = false;
+        for i in 0..col_count {
+            let left = grid.x_lines[i];
+            let right = grid.x_lines[i + 1];
+
+            if cx >= left - 3.0 && cx < right + 3.0 {
+                cols[i].push(it);
+                assigned = true;
+                break;
+            }
+        }
+
+        // Jeśli nie pasuje, znajdź najbliższą kolumnę
+        if !assigned {
+            let mut best_idx = 0;
+            let mut best_dist = f32::INFINITY;
+
+            for i in 0..col_count {
+                let left = grid.x_lines[i];
+                let right = grid.x_lines[i + 1];
+                let center = (left + right) * 0.5;
+                let dist = (cx - center).abs();
+
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = i;
+                }
+            }
+
+            cols[best_idx].push(it);
+        }
+    }
+
+    cols.into_iter()
+        .map(|mut cell| {
+            cell.sort_by(|a, b| a.x0.partial_cmp(&b.x0).unwrap());
+            let s = cell
+                .into_iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            s.trim().to_string()
+        })
+        .collect()
+}
+
+fn render_table_row_md(cols: &[String]) -> String {
+    let esc = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    let cells = cols.iter().map(|c| esc(c)).collect::<Vec<_>>();
+    format!("| {} |", cells.join(" | "))
+}
+
+fn is_heading_line(line: &[TextItem], body_font_guess: f32) -> Option<usize> {
+    if line.is_empty() {
+        return None;
+    }
+
+    let avg = line.iter().map(|t| t.font_size).sum::<f32>() / line.len() as f32;
+
+    if avg >= body_font_guess * 1.5 {
+        Some(1)
+    } else if avg >= body_font_guess * 1.3 {
+        Some(2)
+    } else if avg >= body_font_guess * 1.15 {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn guess_body_font(items: &[TextItem]) -> f32 {
+    let mut v: Vec<f32> = items.iter().map(|t| t.font_size).collect();
+    if v.is_empty() {
+        return 12.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2].max(9.0)
+}
+fn is_table_marker_line(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("Tabela 1") || t.starts_with("Tabela 2") || t.starts_with("Tabela 3")
+}
+
+fn looks_like_group_header(s: &str) -> bool {
+    // "GRUPA L 5G / PLAY L 5G"
+    let l = s.to_lowercase();
+    l.contains("grupa") && l.contains("play")
+}
+fn looks_like_lp_header(s: &str) -> bool {
+    // "LP." i "Taryfa / oferta" bywają rozrzucone na 1–2 linie
+    let l = s.to_lowercase();
+    (l.contains("lp") || l.contains("lp.")) && (l.contains("taryfa") || l.contains("oferta"))
+}
+
+fn starts_with_lp_number(s: &str) -> Option<String> {
+    // "2." "3." "5." -> "2" "3" "5"
+    let first = s.split_whitespace().next()?;
+    if first.ends_with('.') {
+        let n = first.trim_end_matches('.');
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            return Some(n.to_string());
+        }
+    }
+    None
+}
+
+fn try_render_price_table_block(
+    out: &mut BufWriter<File>,
+    lines: &[Vec<TextItem>],
+    start_idx: usize,
+) -> Option<usize> {
+    let mut i = start_idx;
+
+    // 0) tytuł tabeli jako heading
+    let title = lines[i]
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    writeln!(out, "\n### {}\n", title.trim()).ok()?;
+    i += 1;
+
+    // 1) PREAMBLE: zbieramy:
+    // - group header: "GRUPA ... PLAY ..."
+    // - ewentualne linie typu "LP. Taryfa/oferta" jako preface (nie do tabeli)
+    // - plus headers: "(+10) ... (+250)" -> header kolumn
+    let mut group_header_acc = String::new();
+    let mut preface_acc: Vec<String> = Vec::new();
+    let mut plus_headers: Vec<String> = Vec::new();
+
+    while i < lines.len() {
+        let plain = lines[i]
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let plain = plain.trim().to_string();
+
+        if plain.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // stopki / kolejna tabela
+        if is_footer_line(&plain) {
+            return None;
+        }
+        if i != start_idx && is_table_marker_line(&plain) {
+            return None;
+        }
+
+        if looks_like_group_header(&plain) {
+            if !group_header_acc.is_empty() {
+                group_header_acc.push(' ');
+            }
+            group_header_acc.push_str(&plain);
+            i += 1;
+            continue;
+        }
+
+        // zlepiaj "LP" / "Taryfa/oferta" / "Pozycja w cenniku" w preface
+        if looks_like_lp_header(&plain) || plain.to_lowercase().contains("pozycja") || plain.to_lowercase().contains("cenniku") {
+            preface_acc.push(plain);
+            i += 1;
+            continue;
+        }
+
+        // szukamy linii z (+..)
+        let toks = extract_money_like_tokens(&plain);
+        let plus_cnt = toks.iter().filter(|t| t.starts_with("(+")).count();
+        if plus_cnt >= 6 {
+            plus_headers = toks.into_iter().filter(|t| t.starts_with("(+")).collect();
+            i += 1;
+            break;
+        }
+
+        // jeżeli trafiliśmy na coś innego zanim znaleźliśmy (+..),
+        // to zwykle jest to fragment tytułu/wstępu – ale nie pakujmy tego w label.
+        // Zapisz jako preface i idź dalej (max kilka linii).
+        if preface_acc.len() < 4 {
+            preface_acc.push(plain);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if plus_headers.is_empty() {
+        return None;
+    }
+
+    // 2) Wypisz grupę i preface jako tekst NAD tabelą
+    if !group_header_acc.trim().is_empty() {
+        writeln!(out, "**{}**\n", group_header_acc.trim()).ok()?;
+    }
+    if !preface_acc.is_empty() {
+        // żeby nie dublować i nie robić śmietnika – jedna linia
+        let merged = preface_acc.join(" ");
+        writeln!(out, "**{}**\n", merged.trim()).ok()?;
+    }
+
+    // 3) Header tabeli: LP | Opis | (+10) ... (+250)
+    let mut header: Vec<String> = Vec::new();
+    header.push("LP".to_string());
+    header.push("Opis".to_string());
+    header.extend(plus_headers.clone());
+
+    writeln!(out, "{}", render_table_row_md(&header)).ok()?;
+    writeln!(
+        out,
+        "|{}|",
+        header.iter().map(|_| "---").collect::<Vec<_>>().join("|")
+    )
+        .ok()?;
+
+    // 4) DATA: Budujemy wiersze tak:
+    // - zbieramy opis (pending_desc) z linii niecenowych
+    // - gdy pojawi się linia cenowa (>=6 "xx zł") => emit wiersz
+    // - po min. 2 wierszach: jeśli trafi się zwykły tekst bez cen => koniec tabeli
+    let target_cols = plus_headers.len();
+    let mut pending_desc: Option<String> = None;
+    let mut pending_lp: Option<String> = None;
+    let mut rows_emitted = 0usize;
+
+    while i < lines.len() {
+        let plain = lines[i]
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let plain = plain.trim().to_string();
+
+        if plain.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // stop
+        if is_footer_line(&plain) || (i != start_idx && is_table_marker_line(&plain)) {
+            break;
+        }
+
+        // koniec tabeli po wejściu w "tekst ciągły" (po tym jak już coś wyrenderowaliśmy)
+        if rows_emitted >= 2 && !is_price_row(&plain) {
+            // jeżeli wygląda jak zwykły paragraf – wychodzimy
+            let low = plain.to_lowercase();
+            let looks_like_paragraph = low.contains("nielimitowane")
+                || low.contains("obejmuje")
+                || low.contains("internet")
+                || low.contains("nie dotyczy")
+                || low.contains("sms")
+                || low.contains("mms");
+            if looks_like_paragraph {
+                break;
+            }
+        }
+
+        if is_price_row(&plain) {
+            // LP i reszta tekstu
+            let (rest, lp_opt) = strip_leading_lp_token(&plain);
+            let lp = lp_opt.or_else(|| pending_lp.take()).unwrap_or_else(|| "".to_string());
+
+            // ceny: tylko "xx zł"
+            let mut vals = extract_money_like_tokens(&plain);
+            let mut zl_vals: Vec<String> = vals
+                .drain(..)
+                .filter(|t| t.ends_with("zł"))
+                .collect();
+
+            // Jeżeli w tej linii nie ma "zł" (bo to byłby nagłówek plusów) – pomijamy
+            if zl_vals.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            // opis: preferuj pending_desc, ale jak brak – bierz rest
+            let mut desc = pending_desc.take().unwrap_or_else(|| rest.trim().to_string());
+            desc = desc.replace("  ", " ").trim().to_string();
+
+            // Heurystyka: Pdfium często robi "2." na osobnej linii, a ceny na następnej.
+            // Jeśli desc jest puste albo wygląda jak urwany fragment, dołącz rest.
+            if desc.is_empty() && !rest.trim().is_empty() {
+                desc = rest.trim().to_string();
+            }
+
+            let mut row: Vec<String> = Vec::with_capacity(2 + target_cols);
+            row.push(lp);
+            row.push(desc);
+
+            // Przypadek jednej ceny na całą tabelę (np. "4. 10 zł")
+            if zl_vals.len() == 1 {
+                row.push(zl_vals[0].clone());
+                for _ in 1..target_cols {
+                    row.push("".to_string());
+                }
+            } else {
+                // normalny przypadek: dużo cen
+                if zl_vals.len() > target_cols {
+                    zl_vals.truncate(target_cols);
+                }
+                for v in zl_vals {
+                    row.push(v);
+                }
+                while row.len() < 2 + target_cols {
+                    row.push("".to_string());
+                }
+            }
+
+            if !is_noise_row(&row) {
+                writeln!(out, "{}", render_table_row_md(&row)).ok()?;
+                rows_emitted += 1;
+            }
+
+            i += 1;
+            continue;
+        }
+
+        // Linia niecenowa: budujemy opis
+        // - jeśli zaczyna się od "2." / "3." / "5." i nie ma cen: traktuj jako start nowego opisu
+        if let Some(lp) = starts_with_lp_number(&plain) {
+            pending_lp = Some(lp);
+            let (rest, _) = strip_leading_lp_token(&plain);
+            let rest = rest.trim().to_string();
+            if !rest.is_empty() {
+                pending_desc = Some(rest);
+            }
+            i += 1;
+            continue;
+        }
+
+        // kontynuacja opisu (sklej), ale tylko do sensownej długości (żeby nie wciągać pół strony)
+        let max_len = 180usize;
+        match pending_desc.take() {
+            None => {
+                pending_desc = Some(plain);
+            }
+            Some(prev) => {
+                let merged = format!("{} {}", prev, plain).replace("  ", " ");
+                pending_desc = Some(merged.chars().take(max_len).collect());
+            }
+        }
+
+        i += 1;
+    }
+
+    writeln!(out).ok()?;
+    Some(i)
+}
+
+
+
+fn strip_leading_lp_token(s: &str) -> (&str, Option<String>) {
+    let t = s.trim_start();
+    let mut it = t.split_whitespace();
+
+    if let Some(first) = it.next() {
+        if first.ends_with('.') {
+            let n = first.trim_end_matches('.');
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                let rest = t[first.len()..].trim_start();
+                return (rest, Some(n.to_string()));
+            }
+        }
+    }
+    (t, None)
+}
+
+
+fn main() -> Result<(), PdfiumError> {
+    let pdfium = Pdfium::new(Pdfium::bind_to_library("libpdfium.dylib")?);
+    let document = pdfium.load_pdf_from_file("tp4.pdf", None)?;
+
+    let file = File::create("output2.md").expect("Błąd pliku");
+    let mut out = BufWriter::new(file);
+
+    for (page_idx, page) in document.pages().iter().enumerate() {
+        writeln!(out, "\n\n---\n## Page {}\n", page_idx + 1).unwrap();
+
+        let text_items = collect_text_items(&page);
+        let body_font = guess_body_font(&text_items);
+
+        let line_segs = collect_line_segs(&page);
+        let table_grid = detect_table_grid(&line_segs);
+
+        if let Some(g) = &table_grid {
+            writeln!(
+                out,
+                "> Detected table grid: cols={}, rows={}, bbox=({:.1},{:.1})-({:.1},{:.1})\n",
+                g.x_lines.len().saturating_sub(1),
+                g.y_lines.len().saturating_sub(1),
+                g.min_x, g.min_y, g.max_x, g.max_y
+            )
+                .unwrap();
+        }
+
+        let lines = group_text_into_lines(&text_items, 2.5);
+
+        let mut in_grid_table = false;
+        let mut grid_header_written = false;
+
+        let mut idx = 0usize;
+        while idx < lines.len() {
+            let line = lines[idx].clone();
+            let plain = line.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+            let plain = plain.trim().to_string();
+            if plain.is_empty() {
+                idx += 1;
+                continue;
+            }
+
+            // HARD BREAK stopki
+            if is_footer_line(&plain) {
+                if in_grid_table {
+                    in_grid_table = false;
+                    grid_header_written = false;
+                    writeln!(out).unwrap();
+                }
+                writeln!(out, "{}\n", plain).unwrap();
+                idx += 1;
+                continue;
+            }
+
+            // SPECJALNY BLOK: Tabela 2 / Tabela 3 (Page 2)
+            if plain.starts_with("Tabela 2") || plain.starts_with("Tabela 3") {
+                if in_grid_table {
+                    in_grid_table = false;
+                    grid_header_written = false;
+                    writeln!(out).unwrap();
+                }
+
+                if let Some(next_idx) = try_render_price_table_block(&mut out, &lines, idx) {
+                    idx = next_idx;
+                    continue;
+                }
+            }
+
+            // GRID TABLE (jeśli wykryty)
+            let is_grid_line = table_grid
+                .as_ref()
+                .map(|g| is_inside_table(&line, g))
+                .unwrap_or(false);
+
+            if is_grid_line {
+                let g = table_grid.as_ref().unwrap();
+
+                if !in_grid_table {
+                    in_grid_table = true;
+                    grid_header_written = false;
+                    writeln!(out).unwrap();
+                }
+
+                let cols = assign_to_columns(&line, g);
+
+                if is_noise_row(&cols) {
+                    idx += 1;
+                    continue;
+                }
+
+                if !grid_header_written {
+                    writeln!(out, "{}", render_table_row_md(&cols)).unwrap();
+                    writeln!(out, "|{}|", cols.iter().map(|_| "---").collect::<Vec<_>>().join("|")).unwrap();
+                    grid_header_written = true;
+                } else {
+                    writeln!(out, "{}", render_table_row_md(&cols)).unwrap();
+                }
+
+                idx += 1;
+                continue;
+            } else if in_grid_table {
+                in_grid_table = false;
+                grid_header_written = false;
+                writeln!(out).unwrap();
+            }
+
+            // Heading / paragraf
+            if let Some(level) = is_heading_line(&line, body_font) {
+                let hashes = match level {
+                    1 => "#",
+                    2 => "##",
+                    _ => "###",
+                };
+                writeln!(out, "\n{} {}\n", hashes, plain).unwrap();
+            } else {
+                writeln!(out, "{}\n", plain).unwrap();
+            }
+
+            idx += 1;
+        }
+
+        if in_grid_table {
+            writeln!(out).unwrap();
+        }
+    }
+
+    out.flush().unwrap();
+    println!("OK: zapisano output2.md");
+    Ok(())
+}
+
+fn extract_money_like_tokens(plain: &str) -> Vec<String> {
+    let toks: Vec<&str> = plain.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::new();
+
+    let mut i = 0usize;
+    while i < toks.len() {
+        let t = toks[i].trim();
+
+        // "(+10)" itp.
+        if t.starts_with("(+") && t.ends_with(')') {
+            let inner = &t[2..t.len() - 1];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                out.push(t.to_string());
+            }
+            i += 1;
+            continue;
+        }
+
+        // "7 5 zł" -> "75 zł"
+        if t.len() == 1 && t.chars().all(|c| c.is_ascii_digit()) {
+            if i + 2 < toks.len()
+                && toks[i + 1].len() == 1
+                && toks[i + 1].chars().all(|c| c.is_ascii_digit())
+                && normalize_zl(toks[i + 2]) == Some("zł")
+            {
+                out.push(format!("{}{} zł", t, toks[i + 1]));
+                i += 3;
+                continue;
+            }
+        }
+
+        // "85 zł" / "0 zł"
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            if i + 1 < toks.len() && normalize_zl(toks[i + 1]) == Some("zł") {
+                out.push(format!("{} zł", t));
+                i += 2;
+                continue;
+            }
+            // same liczby czasem są w nagłówkach – zostawiamy
+            out.push(t.to_string());
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
+fn normalize_zl(tok: &str) -> Option<&'static str> {
+    // Pdfium czasem daje "zł" z dziwnymi znakami, ale zwykle tok zaczyna się od "z"
+    let t = tok.trim().to_lowercase();
+    if t == "zł" || t == "zl" {
+        return Some("zł");
+    }
+    // awaryjnie: "zł." / "zł," / "zł*" itp.
+    if t.starts_with("zł") || t.starts_with("zl") {
+        return Some("zł");
+    }
+    None
+}
+
+
+fn is_price_row(plain: &str) -> bool {
+    let tokens = extract_money_like_tokens(plain);
+    let plus_cnt = tokens.iter().filter(|t| t.starts_with("(+")).count();
+    let zl_cnt = tokens.iter().filter(|t| t.ends_with("zł")).count();
+
+    // tabelka cenowa ma dużo (+..) albo dużo "xx zł"
+    plus_cnt >= 6 || zl_cnt >= 6
+}
+
