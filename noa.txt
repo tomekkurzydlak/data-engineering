@@ -2590,3 +2590,78 @@ fn is_price_row(plain: &str) -> bool {
     plus_cnt >= 6 || zl_cnt >= 6
 }
 
+==
+py
+
+#!/usr/bin/env python3
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+def run_marker_single(
+    input_path: Path,
+    output_dir: Path,
+    device: str | None,
+    force_ocr: bool,
+    strip_existing_ocr: bool,
+    paginate_output: bool,
+    debug: bool,
+) -> None:
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "marker_single",
+        str(input_path),
+        "--output_format", "markdown",
+        "--output_dir", str(output_dir),
+    ]
+
+    if force_ocr:
+        cmd.append("--force_ocr")
+    if strip_existing_ocr:
+        cmd.append("--strip_existing_ocr")
+    if paginate_output:
+        cmd.append("--paginate_output")
+    if debug:
+        cmd.append("--debug")
+
+    env = os.environ.copy()
+    if device:
+        # Marker wspiera wymuszenie urządzenia przez TORCH_DEVICE (np. cpu/cuda/mps).
+        env["TORCH_DEVICE"] = device
+
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd, check=True, env=env)
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Convert PDF -> Markdown using Datalab Marker (marker_single).")
+    p.add_argument("input", help="Path to input PDF")
+    p.add_argument("-o", "--out", default="out_marker", help="Output directory (default: out_marker)")
+    p.add_argument("--device", choices=["cpu", "cuda", "mps"], default=None,
+                   help="Override torch device via TORCH_DEVICE (optional)")
+    p.add_argument("--force-ocr", action="store_true", help="Force OCR on all lines/pages")
+    p.add_argument("--strip-existing-ocr", action="store_true", help="Strip existing OCR text and re-run OCR")
+    p.add_argument("--paginate", action="store_true", help="Add page separators to output")
+    p.add_argument("--debug", action="store_true", help="Enable marker debug logs")
+    args = p.parse_args()
+
+    run_marker_single(
+        input_path=Path(args.input),
+        output_dir=Path(args.out),
+        device=args.device,
+        force_ocr=args.force_ocr,
+        strip_existing_ocr=args.strip_existing_ocr,
+        paginate_output=args.paginate,
+        debug=args.debug,
+    )
+    print(f"Done. Check: {args.out}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+-=> python3 main.py ./tp4.pdf -o ./out_maker --device cpu
