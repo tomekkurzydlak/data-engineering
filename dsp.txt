@@ -1,0 +1,190 @@
+use serde_json::Value;
+use anyhow::{Context, Result};
+use tokio::time::{sleep, Instant};
+use std::time::Duration;
+
+impl CloudRunBackend {
+    async fn get_operation_json(&self, op_name: &str) -> Result<Value> {
+        let token = self.get_token().await?;
+        let url = format!("https://run.googleapis.com/v2/{}", op_name);
+
+        let res = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("błąd GET operation")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("GET operation HTTP error {}: {}", status, txt);
+        }
+
+        let v: Value = res.json().await.context("błąd parsowania JSON operation")?;
+        Ok(v)
+    }
+
+    fn extract_execution_name_from_operation(op: &Value) -> Option<String> {
+        // Najczęściej Execution jest w metadata.name albo w response.name (zależnie od LRO)
+        // Trzymamy obie ścieżki defensywnie.
+        op.get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                op.get("response")
+                    .and_then(|r| r.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+    }
+
+    async fn wait_for_execution_name(
+        &self,
+        op_name: &str,
+        max_wait: Duration,
+        interval: Duration,
+    ) -> Result<String> {
+        let start = Instant::now();
+
+        loop {
+            let op = self.get_operation_json(op_name).await?;
+
+            if let Some(exec_name) = Self::extract_execution_name_from_operation(&op) {
+                return Ok(exec_name);
+            }
+
+            if start.elapsed() > max_wait {
+                anyhow::bail!(
+                    "Timeout: nie udało się uzyskać execution name z operation {} w czasie {:?}",
+                    op_name,
+                    max_wait
+                );
+            }
+
+            sleep(interval).await;
+        }
+    }
+}
+
+==
+impl CloudRunBackend {
+    pub async fn start_job(
+        &self,
+        job_name: &str,
+        json_payload: &Value,
+        envs: &HashMap<String, String>,
+        task_timeout: Duration,
+    ) -> Result<String> {
+        let token = self.get_token().await?;
+        let url = format!("{}/jobs/{}:run", self.jobs_base(), job_name);
+
+        let timeout_secs: i64 = task_timeout.as_secs().try_into().unwrap_or(600);
+        let timeout_str = format!("{}s", timeout_secs);
+
+        let env_json: Vec<_> = envs
+            .iter()
+            .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
+            .collect();
+
+        let body = serde_json::json!({
+            "overrides": {
+                "containerOverrides": [{
+                    "name": "job",
+                    "args": [ serde_json::to_string(json_payload)? ],
+                    "env": env_json,
+                    "clearArgs": false
+                }],
+                "taskCount": 1,
+                "timeout": timeout_str
+            }
+        });
+
+        info!(%job_name, "Wywołuję Cloud Run Job (:run) ...");
+
+        let res = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("błąd HTTP POST /jobs/:run")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let txt = res.text().await.unwrap_or_default();
+            anyhow::bail!("Job execution HTTP error {}: {}", status, txt);
+        }
+
+        // :run zwraca Operation (LRO), nie execution. :contentReference[oaicite:1]{index=1}
+        let v: Value = res.json().await.context("błąd parsowania JSON z :run")?;
+        let op_name = v.get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if op_name.is_empty() {
+            anyhow::bail!(":run nie zwrócił pola 'name' (operation)");
+        }
+
+        // Poczekaj aż w operation pojawi się execution name (metadata/response)
+        let exec_name = self
+            .wait_for_execution_name(&op_name, Duration::from_secs(30), Duration::from_millis(500))
+            .await
+            .context("nie udało się ustalić execution name dla uruchomienia")?;
+
+        Ok(exec_name)
+    }
+}
+
+==
+
+impl CloudRunBackend {
+    pub async fn poll_until_done(
+        &self,
+        exec_name: &str,
+        max_wait: Duration,
+        interval: Duration,
+    ) -> Result<String> {
+        let start = Instant::now();
+        let mut last_state: Option<String> = None;
+
+        loop {
+            let status = self.get_execution_status(exec_name).await?;
+            let state = status.state.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+
+            if last_state.as_deref() != Some(state.as_str()) {
+                debug!(%exec_name, %state, "Execution state changed");
+                last_state = Some(state.clone());
+            }
+
+            match state.as_str() {
+                "SUCCEEDED" => {
+                    info!(%exec_name, "Execution SUCCEEDED");
+                    return Ok(state);
+                }
+                "FAILED" | "CANCELLED" => {
+                    error!(%exec_name, %state, "Execution FAILED/CANCELLED");
+                    anyhow::bail!("Execution {} failed ({})", exec_name, state)
+                }
+                "RUNNING" | "QUEUED" | "RECONCILING" => {
+                    if start.elapsed() > max_wait {
+                        error!(%exec_name, "Execution TIMED OUT");
+                        anyhow::bail!("Execution {} timed out after {:?}", exec_name, max_wait)
+                    }
+                    sleep(interval).await;
+                }
+                _ => {
+                    warn!(%exec_name, %state, "Execution w stanie nieznanym — kontynuuję polling");
+                    if start.elapsed() > max_wait {
+                        anyhow::bail!("Execution {} timed out in UNKNOWN state", exec_name);
+                    }
+                    sleep(interval).await;
+                }
+            }
+        }
+    }
+}
