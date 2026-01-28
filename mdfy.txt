@@ -1,8 +1,3 @@
-payload
-==
-// ---------------------------------------------------------------------------------
-// DYNAMIC + BATCH  (payload = prefiks pipeline, DB = kontynuacja)
-// ---------------------------------------------------------------------------------
 async fn run_dynamic_wfl_batch_jobs(&self, files: Vec<FileProcess>) -> Result<()> {
     let db = self
         .db
@@ -13,196 +8,136 @@ async fn run_dynamic_wfl_batch_jobs(&self, files: Vec<FileProcess>) -> Result<()
     let fw_id = self
         .cfg
         .file_watcher_id
-        .ok_or_else(|| anyhow!("dynamic+batch wymaga parametru --file-watcher-id"))?;
+        .ok_or_else(|| anyhow::anyhow!("dynamic+batch wymaga parametru --file-watcher-id"))?;
 
-    // =========================================================================
-    // 1️⃣ KROKI Z PAYLOADU — wykonujemy WSZYSTKIE, w kolejności seq
-    // =========================================================================
+    let file_watcher_id = self.cfg.file_watcher_id.unwrap_or(0);
+    let tech_insert_id = self.cfg.tech_insert_id.unwrap_or(0);
+    let tech_update_id = self.cfg.tech_insert_id.unwrap_or(0);
 
-    // seq -> [(file_id, uri, step)]
-    let mut payload_steps: HashMap<u32, Vec<(String, String, ProcessStep)>> = HashMap::new();
-
-    // ostatni wykonany seq per file (ustawiany na podstawie payloadu)
-    let mut last_seq: HashMap<String, u32> = HashMap::new();
+    // -----------------------------------------------------------------------------
+    // FAZA A: PAYLOAD1 (wejściowy) — wykonaj WSZYSTKIE kroki sekwencyjnie per file
+    // -----------------------------------------------------------------------------
+    let mut payload1_map: HashMap<String, (String, VecDeque<ProcessStep>)> = HashMap::new();
 
     for f in &files {
         if f.processes.is_empty() {
-            warn!(
-                file_id = %f.file_id,
-                "DYNAMIC+BATCH: payload zawiera plik bez kroków — pomijam"
-            );
+            warn!(file_id = %f.file_id, "DYNAMIC+BATCH: payload1 ma pustą listę kroków — pomijam plik");
             continue;
         }
 
         let mut steps = f.processes.clone();
-        steps.sort_by_key(|s| s.exec_process_seq);
-
-        for step in &steps {
-            payload_steps
-                .entry(step.exec_process_seq)
-                .or_default()
-                .push((
-                    f.file_id.clone(),
-                    f.gcs_file_uri.clone(),
-                    step.clone(),
-                ));
-        }
-
-        if let Some(max_step) = steps.last() {
-            last_seq.insert(f.file_id.clone(), max_step.exec_process_seq);
-        }
+        steps.sort_by_key(|s| s.exec_process_seq); // kolejność TYLKO wewnątrz payload1
+        payload1_map.insert(f.file_id.clone(), (f.gcs_file_uri.clone(), steps.into()));
     }
 
-    if payload_steps.is_empty() {
-        warn!("DYNAMIC+BATCH: brak kroków w payloadzie — nic do wykonania");
-        return Ok(());
-    }
+    // Wave-based barrier: w każdej iteracji bierzemy 1 krok z każdego pliku (jeśli ma)
+    while !payload1_map.is_empty() {
+        let mut wave: Vec<(String, String, ProcessStep)> = Vec::new();
 
-    let mut payload_seqs: Vec<u32> = payload_steps.keys().cloned().collect();
-    payload_seqs.sort_unstable();
-
-    info!(
-        seqs = ?payload_seqs,
-        "DYNAMIC+BATCH: start — wykonuję kroki z payloadu"
-    );
-
-    for seq in payload_seqs {
-        let batch = &payload_steps[&seq];
-        let process_cd = batch[0].2.process_cd.clone();
-
-        info!(
-            seq,
-            count = batch.len(),
-            %process_cd,
-            "DYNAMIC+BATCH: batch kroków z payloadu"
-        );
-
-        if let Some(db) = &self.db {
-            let file_watcher_id = self.cfg.file_watcher_id.unwrap_or(0);
-            let tech_insert_id = self.cfg.tech_insert_id.unwrap_or(0);
-
-            let pid = db
-                .init_batch_session(&process_cd, file_watcher_id, tech_insert_id)
-                .await
-                .context("DYNAMIC+BATCH: błąd start_process_watcher_f (payload)")?;
-
-            let result = self.run_batch_for_steps(batch).await;
-
-            let tech_update_id = self.cfg.tech_insert_id.unwrap_or(0);
-            let (status_cd, error_msg) = match &result {
-                Ok(_) => ("COMPLETED", "".to_string()),
-                Err(e) => ("ERROR", e.to_string()),
-            };
-
-            if let Err(e) = db
-                .end_session(pid, status_cd, &error_msg, tech_update_id)
-                .await
-            {
-                error!(
-                    error=?e,
-                    %pid,
-                    %process_cd,
-                    "DYNAMIC+BATCH: błąd finish_process_f (payload)"
-                );
-            }
-
-            result?;
-        } else {
-            self.run_batch_for_steps(batch).await?;
-        }
-    }
-
-    // =========================================================================
-    // 2️⃣ KOLEJNE KROKI Z DB — kontynuacja pipeline
-    // =========================================================================
-
-    let full_map = db.get_batch_steps(fw_id).await?;
-    if full_map.is_empty() {
-        info!("DYNAMIC+BATCH: brak kolejnych kroków w DB — pipeline zakończony");
-        return Ok(());
-    }
-
-    // file_id -> (uri, VecDeque<ProcessStep>)
-    let mut steps_map: HashMap<String, (String, VecDeque<ProcessStep>)> = HashMap::new();
-
-    for (file_id, (uri, steps_vec)) in full_map.into_iter() {
-        let dq: VecDeque<ProcessStep> = steps_vec.into();
-        steps_map.insert(file_id.clone(), (uri, dq));
-    }
-
-    // =========================================================================
-    // 3️⃣ KOLEJNE BATCH-E Z DB (jak dotychczas)
-    // =========================================================================
-    loop {
-        let mut batch: Vec<(String, String, ProcessStep)> = Vec::new();
-
-        for (file_id, (uri, dq)) in steps_map.iter_mut() {
-            let prev_seq = *last_seq.get(file_id).unwrap_or(&0);
-
-            if let Some(next_step) = dq.pop_front() {
-                if next_step.exec_process_seq > prev_seq {
-                    last_seq.insert(file_id.clone(), next_step.exec_process_seq);
-                    batch.push((file_id.clone(), uri.clone(), next_step));
-                } else {
-                    warn!(
-                        %file_id,
-                        prev_seq,
-                        next = next_step.exec_process_seq,
-                        "DYNAMIC+BATCH: krok z DB ma seq <= poprzedni — pomijam"
-                    );
-                }
+        for (file_id, (uri, dq)) in payload1_map.iter_mut() {
+            if let Some(step) = dq.pop_front() {
+                wave.push((file_id.clone(), uri.clone(), step));
             }
         }
 
         // usuń puste kolejki
-        steps_map.retain(|_, (_, dq)| !dq.is_empty());
+        payload1_map.retain(|_, (_, dq)| !dq.is_empty());
 
-        if batch.is_empty() {
-            info!("DYNAMIC+BATCH: brak kolejnych kroków — pipeline zakończony");
+        if wave.is_empty() {
             break;
         }
 
-        let process_cd = batch[0].2.process_cd.clone();
-        let seq = batch[0].2.exec_process_seq;
-
+        let process_cd = wave[0].2.process_cd.clone();
         info!(
-            count = batch.len(),
+            count = wave.len(),
             %process_cd,
-            seq,
-            "DYNAMIC+BATCH: batch kolejnych kroków z DB"
+            "DYNAMIC+BATCH: payload1 — uruchamiam wave (1 krok per plik)"
         );
 
         if let Some(db) = &self.db {
-            let file_watcher_id = self.cfg.file_watcher_id.unwrap_or(0);
-            let tech_insert_id = self.cfg.tech_insert_id.unwrap_or(0);
-
             let pid = db
-                .init_session(&process_cd, file_watcher_id, tech_insert_id)
+                .init_batch_session(&process_cd, file_watcher_id, tech_insert_id)
                 .await
-                .context("DYNAMIC+BATCH: błąd start_process_f (DB)")?;
+                .context("DYNAMIC+BATCH: payload1 — błąd start_process_watcher_f")?;
 
-            let result = self.run_batch_for_steps(&batch).await;
-
-            let tech_update_id = self
-                .cfg
-                .tech_insert_id
-                .unwrap_or(0);
+            let result = self.run_batch_for_steps(&wave).await;
 
             let (status_cd, error_msg) = match &result {
                 Ok(_) => ("COMPLETED", "".to_string()),
                 Err(e) => ("ERROR", e.to_string()),
             };
 
-            if let Err(e) = db
-                .end_session(pid, status_cd, &error_msg, tech_update_id)
-                .await
-            {
-                error!(error=?e, %pid, "DYNAMIC+BATCH: błąd finish_process_f (DB)");
+            if let Err(e) = db.end_session(pid, status_cd, &error_msg, tech_update_id).await {
+                error!(error=?e, %pid, "DYNAMIC+BATCH: payload1 — błąd finish_process_f");
             }
 
             result?;
         } else {
-            self.run_batch_for_steps(&batch).await?;
+            self.run_batch_for_steps(&wave).await?;
+        }
+    }
+
+    // -----------------------------------------------------------------------------
+    // FAZA B: PAYLOAD2 (z DB) — dopiero po wyczerpaniu payload1
+    // -----------------------------------------------------------------------------
+    let full_map = db.get_batch_steps(fw_id).await?;
+    if full_map.is_empty() {
+        info!("DYNAMIC+BATCH: DB nie zwróciła kolejnych kroków — pipeline zakończony");
+        return Ok(());
+    }
+
+    let mut payload2_map: HashMap<String, (String, VecDeque<ProcessStep>)> = HashMap::new();
+    for (file_id, (uri, mut steps)) in full_map.into_iter() {
+        if steps.is_empty() {
+            continue;
+        }
+        // kolejność TYLKO wewnątrz payload2 (jeśli DB już zwraca w kolejności, sort jest neutralny)
+        steps.sort_by_key(|s| s.exec_process_seq);
+        payload2_map.insert(file_id, (uri, steps.into()));
+    }
+
+    while !payload2_map.is_empty() {
+        let mut wave: Vec<(String, String, ProcessStep)> = Vec::new();
+
+        for (file_id, (uri, dq)) in payload2_map.iter_mut() {
+            if let Some(step) = dq.pop_front() {
+                wave.push((file_id.clone(), uri.clone(), step));
+            }
+        }
+
+        payload2_map.retain(|_, (_, dq)| !dq.is_empty());
+
+        if wave.is_empty() {
+            break;
+        }
+
+        let process_cd = wave[0].2.process_cd.clone();
+        info!(
+            count = wave.len(),
+            %process_cd,
+            "DYNAMIC+BATCH: payload2(DB) — uruchamiam wave (1 krok per plik)"
+        );
+
+        if let Some(db) = &self.db {
+            let pid = db
+                .init_batch_session(&process_cd, file_watcher_id, tech_insert_id)
+                .await
+                .context("DYNAMIC+BATCH: payload2 — błąd start_process_watcher_f")?;
+
+            let result = self.run_batch_for_steps(&wave).await;
+
+            let (status_cd, error_msg) = match &result {
+                Ok(_) => ("COMPLETED", "".to_string()),
+                Err(e) => ("ERROR", e.to_string()),
+            };
+
+            if let Err(e) = db.end_session(pid, status_cd, &error_msg, tech_update_id).await {
+                error!(error=?e, %pid, "DYNAMIC+BATCH: payload2 — błąd finish_process_f");
+            }
+
+            result?;
+        } else {
+            self.run_batch_for_steps(&wave).await?;
         }
     }
 
@@ -210,134 +145,304 @@ async fn run_dynamic_wfl_batch_jobs(&self, files: Vec<FileProcess>) -> Result<()
 }
 
 ==
-fm.type_specific_metadata = Some(payload);
 
-// 1) wytwórz markdown (albo z pdftotext, albo z docling)
-let content_md: String = match args.pdf2md_engine {
-    Pdf2MdEngine::Pdf2text => {
-        let pdf2text_args = &["-layout", path_str, "-"];
-        run_command_with_args("pdftotext", pdf2text_args)?
-    }
-    Pdf2MdEngine::Docling => {
-        run_docling_md(path_str)?
-    }
-};
+async fn run_dynamic_wfl_async_jobs(
+    &self,
+    files: Vec<FileProcess>,
+    error_flag: Arc<AtomicBool>,
+) -> Result<()> {
+    let db = self
+        .db
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Brak połączenia z DB dla dynamicznego workflow"))?;
 
-// 2) reszta jak wcześniej: hash + zapis do GCS + zwrot URI
-let enriched_data = EnrichedFile {
-    uri: gcs_data_uri.clone(),
-    format: "markdown".to_owned(),
-    hash_sha256: sha256_content(content_md.as_bytes())?,
-};
-fm.enriched_file = Some(enriched_data);
+    let (tx_tasks, rx_tasks): (Sender<FileTask>, Receiver<FileTask>) = unbounded();
 
-let bs = bytes::Bytes::from_owner(content_md.into_bytes());
-write_to_gcs(&gcs_data_uri, bs).await?;
-Ok(gcs_data_uri)
+    let remaining_files = Arc::new(AtomicUsize::new(files.len()));
+    let steps_cache: Arc<DashMap<String, VecDeque<ProcessStep>>> = Arc::new(DashMap::new());
 
+    let handle = tokio::runtime::Handle::current();
 
-
-==
-pub fn run_docling_md(pdf_path: &str) -> Result<String> {
-    // Docling zapisuje wynik do katalogu, więc robimy tmpdir per plik
-    let out_dir = PathBuf::from(format!("/tmp/docling_{}", Uuid::new_v4()));
-    fs::create_dir_all(&out_dir)?;
-
-    // Default: bez OCR (wydajność). Jeśli masz skany – później dorobisz przełącznik.
-    let args = [
-        "--to", "md",
-        "--output", out_dir.to_str().ok_or_else(|| anyhow!("Bad out_dir"))?,
-        "--no-ocr",
-        "--tables",
-        pdf_path,
-    ];
-
-    let output = std::process::Command::new("docling")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| anyhow!("Failed to run docling binary: {e}"))?;
-
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(anyhow!("docling failed: {}", err));
-    }
-
-    // Znajdź wygenerowany plik .md
-    let mut md_files: Vec<PathBuf> = fs::read_dir(&out_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
-        .collect();
-
-    md_files.sort();
-
-    let md_path = md_files
-        .pop()
-        .ok_or_else(|| anyhow!("docling finished but no .md file found in {}", out_dir.display()))?;
-
-    let md = fs::read_to_string(&md_path)?;
-
-    // Sprzątanie (best effort)
-    let _ = fs::remove_dir_all(&out_dir);
-
-    Ok(md)
-}
-
-
-===
-use std::error::Error;
-use std::ffi::OsStr;
-use std::fs;
-use std::path::Path;
-
-const DEFAULT_INPUT_DIR: &str = "/Users/tomek/IdeaProjects/test-pdfium/testdata/pdfs";
-const DEFAULT_OUTPUT_DIR: &str = "out";
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
-    let input_dir = args.next().unwrap_or_else(|| DEFAULT_INPUT_DIR.to_string());
-    let output_dir = args.next().unwrap_or_else(|| DEFAULT_OUTPUT_DIR.to_string());
-
-    fs::create_dir_all(&output_dir)?;
-
-    for entry in fs::read_dir(&input_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !is_pdf(&path) {
+    // 1) Dla każdego pliku: enqueue pierwszy krok z payload1, resztę payload1 włóż do cache
+    for f in &files {
+        if f.processes.is_empty() {
+            remaining_files.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
 
-        println!("Converting: {}", path.display());
-        let markdown = markdownify::convert(path.as_path())?;
+        let mut steps = f.processes.clone();
+        steps.sort_by_key(|s| s.exec_process_seq); // kolejność tylko w payload1
 
-        let stem = path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .ok_or("Failed to read file stem")?;
-        let out_path = Path::new(&output_dir).join(format!("{stem}.md"));
-        fs::write(&out_path, markdown)?;
-        println!("Wrote: {}", out_path.display());
+        let first_step = steps.remove(0);
+
+        if !steps.is_empty() {
+            steps_cache.insert(f.file_id.clone(), steps.into());
+        }
+
+        tx_tasks.send(FileTask {
+            file_id: f.file_id.clone(),
+            gcs_file_uri: f.gcs_file_uri.clone(),
+            step: first_step,
+        })?;
     }
+
+    drop(files);
+
+    let workers = self.cfg.max_workers as usize;
+    let cpu = num_cpus::get();
+    let thread_workers = std::cmp::min(cpu * 2, workers).max(1);
+
+    let mut worker_handles = Vec::new();
+
+    for _ in 0..thread_workers {
+        let rx_tasks_clone = rx_tasks.clone();
+        let tx_tasks_clone = tx_tasks.clone();
+        let dispatcher = self.clone_light();
+        let remaining_files = Arc::clone(&remaining_files);
+        let steps_cache = Arc::clone(&steps_cache);
+        let db_clone = db.clone();
+        let error_flag = error_flag.clone();
+        let handle = handle.clone();
+
+        let h = std::thread::spawn(move || {
+            loop {
+                if remaining_files.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+
+                match rx_tasks_clone.recv_timeout(Duration::from_secs(1)) {
+                    Ok(task) => {
+                        let dispatcher_c = dispatcher.clone_light();
+                        let db_for_call = db_clone.clone();
+
+                        let res = handle.block_on(async {
+                            dispatcher_c
+                                .process_dynamic_task(
+                                    task,
+                                    &tx_tasks_clone,
+                                    &remaining_files,
+                                    &steps_cache,
+                                    &db_for_call,
+                                    &error_flag,
+                                )
+                                .await
+                        });
+
+                        if let Err(e) = res {
+                            error!(error=?e, "DYNAMIC+ASYNC worker error");
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        worker_handles.push(h);
+    }
+
+    drop(tx_tasks);
+
+    for h in worker_handles {
+        let _ = h.join();
+    }
+
+    info!(
+        remaining = remaining_files.load(Ordering::Acquire),
+        "DYNAMIC+ASYNC zakończone"
+    );
 
     Ok(())
 }
 
-fn is_pdf(path: &Path) -> bool {
-    match path.extension().and_then(OsStr::to_str) {
-        Some(ext) => ext.eq_ignore_ascii_case("pdf"),
-        None => false,
-    }
-}
-
-
 ==
 
-[package]
-name = "markdownify-test"
-version = "0.1.0"
-edition = "2024"
+async fn process_dynamic_task(
+    &self,
+    task: FileTask,
+    tx_tasks: &Sender<FileTask>,
+    remaining_files: &Arc<AtomicUsize>,
+    steps_cache: &Arc<DashMap<String, VecDeque<ProcessStep>>>,
+    db: &Arc<Db>,
+    error_flag: &Arc<AtomicBool>,
+) -> Result<()> {
+    let file_id = &task.file_id;
+    let gcs_file_uri = &task.gcs_file_uri;
+    let step = &task.step;
 
-[dependencies]
-markdownify = "0.2.1"
+    // 1) wykonaj krok (z DB session wrapperem)
+    if let Err(e) = self.execute_step_with_session(file_id, gcs_file_uri, step).await {
+        error!(
+            error=?e,
+            %file_id,
+            seq = step.exec_process_seq,
+            "DYNAMIC+ASYNC: błąd wykonania kroku"
+        );
+        error_flag.store(true, Ordering::SeqCst);
+        steps_cache.remove(file_id);
+        remaining_files.fetch_sub(1, Ordering::AcqRel);
+        return Err(e);
+    }
+
+    // 2) jeśli w cache są jeszcze kroki (payload1 prefix albo już załadowane z DB) → enqueue next
+    if let Some(mut entry) = steps_cache.get_mut(file_id) {
+        if let Some(next_step) = entry.pop_front() {
+            drop(entry);
+
+            let next_task = FileTask {
+                file_id: file_id.clone(),
+                gcs_file_uri: gcs_file_uri.clone(),
+                step: next_step,
+            };
+
+            if let Err(e) = tx_tasks.send(next_task) {
+                error!(error=?e, %file_id, "DYNAMIC+ASYNC: kanał workerów zamknięty");
+                error_flag.store(true, Ordering::SeqCst);
+                steps_cache.remove(file_id);
+                remaining_files.fetch_sub(1, Ordering::AcqRel);
+                return Err(anyhow::anyhow!("Kanał workerów zamknięty"));
+            }
+
+            return Ok(());
+        } else {
+            // cache istnieje, ale pusty → czyścimy i przechodzimy do DB
+            drop(entry);
+            steps_cache.remove(file_id);
+        }
+    }
+
+    // 3) cache puste → pobierz kontynuację (payload2) z DB z retry
+    const BACKOFFS_MS: &[u64] = &[100, 500, 1_000, 3_000, 5_000];
+
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut steps_opt: Option<Vec<ProcessStep>> = None;
+
+    for (attempt, delay_ms) in BACKOFFS_MS.iter().enumerate() {
+        match db.get_steps_for_file(file_id).await {
+            Ok(s) => {
+                // OK => DB odpowiedziała poprawnie.
+                // empty => koniec kroków (normalnie)
+                // non-empty => mamy kolejne kroki (payload2)
+                steps_opt = Some(s);
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let retryable =
+                    msg.contains(StepErrorCode::NullJson.as_str())
+                        || msg.contains(StepErrorCode::EmptyProcesses.as_str())
+                        || msg.contains(StepErrorCode::MissingProcesses.as_str())
+                        || msg.contains("brak zdefiniowanych procesów");
+
+                if !retryable {
+                    // hard fail
+                    let code = if msg.contains("NULL_JSON") {
+                        StepErrorCode::NullJson
+                    } else if msg.contains("JSON_PARSE_ERROR") {
+                        StepErrorCode::JsonParse
+                    } else if msg.contains("MISSING_PROCESSES") {
+                        StepErrorCode::MissingProcesses
+                    } else if msg.contains("EMPTY_PROCESSES") {
+                        StepErrorCode::EmptyProcesses
+                    } else {
+                        StepErrorCode::DbFetchError
+                    };
+
+                    let _ = self.fail_step_session("UNKNOWN", file_id, code, &msg).await;
+
+                    error!(error=?e, %file_id, "DYNAMIC+ASYNC: błąd get_steps_for_file (hard)");
+                    error_flag.store(true, Ordering::SeqCst);
+                    remaining_files.fetch_sub(1, Ordering::AcqRel);
+                    return Err(e);
+                }
+
+                last_err = Some(e);
+            }
+        }
+
+        if attempt + 1 < BACKOFFS_MS.len() {
+            debug!(
+                %file_id,
+                attempt = attempt + 1,
+                sleep_ms = *delay_ms,
+                "DYNAMIC+ASYNC: payload2 not ready yet — retry"
+            );
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
+    }
+
+    // po retry: jeśli nadal brak odpowiedzi -> SOFT FAIL pliku
+    let steps = match steps_opt {
+        Some(s) => s,
+        None => {
+            let msg = last_err
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+
+            let code = if msg.contains("NULL_JSON") {
+                StepErrorCode::NullJson
+            } else if msg.contains("JSON_PARSE_ERROR") {
+                StepErrorCode::JsonParse
+            } else if msg.contains("MISSING_PROCESSES") {
+                StepErrorCode::MissingProcesses
+            } else if msg.contains("EMPTY_PROCESSES") {
+                StepErrorCode::EmptyProcesses
+            } else {
+                StepErrorCode::DbFetchError
+            };
+
+            let _ = self.fail_step_session("UNKNOWN", file_id, code, &msg).await;
+
+            error!(
+                %file_id,
+                code = code.as_str(),
+                last_error = %msg,
+                "DYNAMIC+ASYNC: payload2 nadal niegotowy po retry -> SOFT FAIL pliku"
+            );
+
+            error_flag.store(true, Ordering::SeqCst);
+            remaining_files.fetch_sub(1, Ordering::AcqRel);
+            return Ok(());
+        }
+    };
+
+    if steps.is_empty() {
+        // normalny koniec pliku (DB zwróciła pusto)
+        remaining_files.fetch_sub(1, Ordering::AcqRel);
+        return Ok(());
+    }
+
+    // payload2: kolejność tylko wewnątrz tego payloadu
+    let mut sorted = steps;
+    sorted.sort_by_key(|s| s.exec_process_seq);
+
+    let mut dq: VecDeque<ProcessStep> = sorted.into();
+    let Some(first_step) = dq.pop_front() else {
+        remaining_files.fetch_sub(1, Ordering::AcqRel);
+        return Ok(());
+    };
+
+    // resztę payload2 wrzuć do cache
+    if !dq.is_empty() {
+        steps_cache.insert(file_id.clone(), dq);
+    }
+
+    // enqueue pierwszy krok payload2
+    let next_task = FileTask {
+        file_id: file_id.clone(),
+        gcs_file_uri: gcs_file_uri.clone(),
+        step: first_step,
+    };
+
+    if let Err(e) = tx_tasks.send(next_task) {
+        error!(error=?e, %file_id, "DYNAMIC+ASYNC: kanał workerów zamknięty (po DB)");
+        error_flag.store(true, Ordering::SeqCst);
+        steps_cache.remove(file_id);
+        remaining_files.fetch_sub(1, Ordering::AcqRel);
+        return Err(anyhow::anyhow!("Kanał workerów zamknięty"));
+    }
+
+    Ok(())
+}
