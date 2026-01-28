@@ -1,3 +1,31 @@
+fm.type_specific_metadata = Some(payload);
+
+// 1) wytwórz markdown (albo z pdftotext, albo z docling)
+let content_md: String = match args.pdf2md_engine {
+    Pdf2MdEngine::Pdf2text => {
+        let pdf2text_args = &["-layout", path_str, "-"];
+        run_command_with_args("pdftotext", pdf2text_args)?
+    }
+    Pdf2MdEngine::Docling => {
+        run_docling_md(path_str)?
+    }
+};
+
+// 2) reszta jak wcześniej: hash + zapis do GCS + zwrot URI
+let enriched_data = EnrichedFile {
+    uri: gcs_data_uri.clone(),
+    format: "markdown".to_owned(),
+    hash_sha256: sha256_content(content_md.as_bytes())?,
+};
+fm.enriched_file = Some(enriched_data);
+
+let bs = bytes::Bytes::from_owner(content_md.into_bytes());
+write_to_gcs(&gcs_data_uri, bs).await?;
+Ok(gcs_data_uri)
+
+
+
+==
 pub fn run_docling_md(pdf_path: &str) -> Result<String> {
     // Docling zapisuje wynik do katalogu, więc robimy tmpdir per plik
     let out_dir = PathBuf::from(format!("/tmp/docling_{}", Uuid::new_v4()));
