@@ -1,3 +1,52 @@
+pub fn run_docling_md(pdf_path: &str) -> Result<String> {
+    // Docling zapisuje wynik do katalogu, więc robimy tmpdir per plik
+    let out_dir = PathBuf::from(format!("/tmp/docling_{}", Uuid::new_v4()));
+    fs::create_dir_all(&out_dir)?;
+
+    // Default: bez OCR (wydajność). Jeśli masz skany – później dorobisz przełącznik.
+    let args = [
+        "--to", "md",
+        "--output", out_dir.to_str().ok_or_else(|| anyhow!("Bad out_dir"))?,
+        "--no-ocr",
+        "--tables",
+        pdf_path,
+    ];
+
+    let output = std::process::Command::new("docling")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| anyhow!("Failed to run docling binary: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(anyhow!("docling failed: {}", err));
+    }
+
+    // Znajdź wygenerowany plik .md
+    let mut md_files: Vec<PathBuf> = fs::read_dir(&out_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+        .collect();
+
+    md_files.sort();
+
+    let md_path = md_files
+        .pop()
+        .ok_or_else(|| anyhow!("docling finished but no .md file found in {}", out_dir.display()))?;
+
+    let md = fs::read_to_string(&md_path)?;
+
+    // Sprzątanie (best effort)
+    let _ = fs::remove_dir_all(&out_dir);
+
+    Ok(md)
+}
+
+
+===
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
