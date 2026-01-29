@@ -188,3 +188,90 @@ impl CloudRunBackend {
         }
     }
 }
+==
+
+pub async fn poll_until_done(
+    &self,
+    exec_name: &str,
+    max_wait: Duration,
+    interval: Duration,
+) -> Result<String> {
+    let start = Instant::now();
+    let mut last_state: Option<String> = None;
+
+    // tolerancja na UNKNOWN / brak stanu (propagacja, conditions jeszcze nie ma)
+    let mut unknown_count: u32 = 0;
+    // po ilu "UNKNOWN" z rzędu uznajemy to za błąd (np. 6 * 10s = 60s)
+    let max_unknown: u32 = 6;
+
+    loop {
+        let status = self.get_execution_status(exec_name).await?;
+
+        // ujednolicenie stanu
+        let state = status
+            .state
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+
+        if last_state.as_deref() != Some(state.as_str()) {
+            debug!(%exec_name, %state, "Execution state changed");
+            last_state = Some(state.clone());
+        }
+
+        match state.as_str() {
+            "SUCCEEDED" => {
+                info!(%exec_name, "Execution SUCCEEDED");
+                return Ok(state);
+            }
+            "FAILED" | "CANCELLED" => {
+                error!(%exec_name, %state, "Execution FAILED/CANCELLED");
+                anyhow::bail!("Execution {} failed ({})", exec_name, state);
+            }
+            "RUNNING" | "QUEUED" | "RECONCILING" => {
+                unknown_count = 0;
+
+                if start.elapsed() > max_wait {
+                    error!(%exec_name, "Execution TIMED OUT");
+                    anyhow::bail!(
+                        "Execution {} timed out after {:?}",
+                        exec_name,
+                        max_wait
+                    );
+                }
+                sleep(interval).await;
+            }
+            // wszystko inne traktujemy jak "unknown-ish"
+            _ => {
+                unknown_count += 1;
+                warn!(
+                    %exec_name,
+                    %state,
+                    unknown_count,
+                    max_unknown,
+                    "Execution w stanie nieznanym — kontynuuję polling (tolerancja)"
+                );
+
+                if start.elapsed() > max_wait {
+                    anyhow::bail!(
+                        "Execution {} timed out in state {} after {:?}",
+                        exec_name,
+                        state,
+                        max_wait
+                    );
+                }
+
+                // jeśli UNKNOWN utrzymuje się zbyt długo -> fail
+                if unknown_count >= max_unknown {
+                    anyhow::bail!(
+                        "Execution {} stays in unknown state '{}' for too long ({} polls)",
+                        exec_name,
+                        state,
+                        unknown_count
+                    );
+                }
+
+                sleep(interval).await;
+            }
+        }
+    }
+}
