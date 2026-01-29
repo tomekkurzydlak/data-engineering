@@ -12,267 +12,195 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 
-# Matches any %XX that would indicate still-percent-encoded content
 PERCENT_ESC_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 
 @dataclass
 class Report:
-    # Step 1
     files_found_in_data: int = 0
-    renamed: int = 0
+    copied_to_processed: int = 0
     skipped_no_meta: int = 0
     skipped_bad_meta: int = 0
-    skipped_missing_fullfilename: int = 0
     skipped_extension_mismatch: int = 0
     name_collisions_resolved: int = 0
 
-    # Decoding/validation stats
     url_decoded: int = 0
     decode_failures: int = 0
-    decode_leftover_percent: int = 0
-    decode_leftover_percent_examples: List[str] = None
+    leftover_percent: int = 0
+    leftover_examples: List[str] = None
 
-    # Step 2
     duplicates_removed: int = 0
-    duplicates: List[Tuple[str, str]] = None  # (removed, kept)
+    duplicates: List[Tuple[str, str]] = None
 
     def __post_init__(self):
-        if self.duplicates is None:
-            self.duplicates = []
-        if self.decode_leftover_percent_examples is None:
-            self.decode_leftover_percent_examples = []
+        self.leftover_examples = self.leftover_examples or []
+        self.duplicates = self.duplicates or []
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
+        for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def safe_target_path(target_dir: Path, desired_name: str) -> Tuple[Path, int]:
-    """
-    If desired_name already exists, append ' (n)' before extension.
-    Returns (final_path, collisions_resolved_flag)
-    """
-    desired = target_dir / desired_name
-    if not desired.exists():
-        return desired, 0
+def safe_target_path(dir_: Path, name: str, overwrite: bool) -> Tuple[Path, bool]:
+    target = dir_ / name
+    if overwrite or not target.exists():
+        return target, False
 
-    stem = Path(desired_name).stem
-    suffix = Path(desired_name).suffix
+    stem = Path(name).stem
+    suffix = Path(name).suffix
     n = 1
     while True:
-        candidate = target_dir / f"{stem} ({n}){suffix}"
+        candidate = dir_ / f"{stem} ({n}){suffix}"
         if not candidate.exists():
-            return candidate, 1
+            return candidate, True
         n += 1
 
 
-def load_meta(meta_path: Path) -> Optional[dict]:
+def decode_filename(raw: str, rep: Report, strict: bool) -> Optional[str]:
+    raw = raw.strip().replace("\\", "/")
+
     try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def decode_and_validate_filename(name: str, rep: Report, strict: bool) -> Optional[str]:
-    """
-    1) percent-decode (URL encoding) using UTF-8
-    2) NFC normalize
-    3) validate: no leftover %XX sequences
-    If strict:
-      - on decode error or leftover %XX => return None (skip)
-    Else:
-      - on decode error => keep original
-      - on leftover %XX => keep decoded but report warning
-    """
-    original = name
-
-    # Normalize any accidental path separators; we only care about basename later anyway.
-    name = name.strip().replace("\\", "/")
-
-    decoded = None
-    try:
-        decoded = unquote(name, encoding="utf-8", errors="strict")
-        if decoded != name:
+        decoded = unquote(raw, encoding="utf-8", errors="strict")
+        if decoded != raw:
             rep.url_decoded += 1
     except Exception:
         rep.decode_failures += 1
         if strict:
             return None
-        decoded = name  # keep as-is
+        decoded = raw
 
-    # take basename only (in case meta contains paths)
     decoded = Path(decoded).name
-
-    # NFC normalize
     decoded = unicodedata.normalize("NFC", decoded)
 
-    # Validation: leftover %XX after decoding
     if PERCENT_ESC_RE.search(decoded):
-        rep.decode_leftover_percent += 1
-        if len(rep.decode_leftover_percent_examples) < 20:
-            rep.decode_leftover_percent_examples.append(f"{original} -> {decoded}")
+        rep.leftover_percent += 1
+        if len(rep.leftover_examples) < 10:
+            rep.leftover_examples.append(decoded)
         if strict:
             return None
 
     return decoded
 
 
-def pick_meta_filename(meta: dict) -> Optional[str]:
-    # You said Filename and FullFilename are effectively the same source.
-    # We'll use FullFilename if present; else try Filename + Extension.
+def load_meta_filename(meta_path: Path) -> Optional[str]:
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
     full = meta.get("FullFilename")
     if isinstance(full, str) and full.strip():
         return full.strip()
 
     fn = meta.get("Filename")
     ext = meta.get("Extension")
-    if isinstance(fn, str) and fn.strip() and isinstance(ext, str) and ext.strip():
-        ext = ext.strip().lstrip(".")
-        return f"{fn.strip()}.{ext}"
+    if isinstance(fn, str) and isinstance(ext, str):
+        return f"{fn.strip()}.{ext.strip().lstrip('.')}"
 
     return None
 
 
-def rename_files(data_dir: Path, meta_dir: Path, dry_run: bool, strict: bool) -> Report:
+def process_files(
+    data_dir: Path,
+    meta_dir: Path,
+    processed_dir: Path,
+    overwrite: bool,
+    strict: bool,
+    dry_run: bool,
+) -> Report:
     rep = Report()
-    files = sorted([p for p in data_dir.iterdir() if p.is_file()])
+    processed_dir.mkdir(parents=True, exist_ok=True)
 
-    for src_path in files:
+    for src in sorted(p for p in data_dir.iterdir() if p.is_file()):
         rep.files_found_in_data += 1
-
-        numer_id = src_path.stem  # <numer_id> from <numer_id>.<ext>
-        src_ext = src_path.suffix.lower().lstrip(".")  # ext without dot
+        numer_id = src.stem
+        src_ext = src.suffix.lower().lstrip(".")
 
         meta_path = meta_dir / f"{numer_id}.json"
         if not meta_path.exists():
             rep.skipped_no_meta += 1
             continue
 
-        meta = load_meta(meta_path)
-        if meta is None:
+        meta_name_raw = load_meta_filename(meta_path)
+        if not meta_name_raw:
             rep.skipped_bad_meta += 1
             continue
 
-        meta_full = pick_meta_filename(meta)
-        if not meta_full:
-            rep.skipped_missing_fullfilename += 1
-            continue
-
-        decoded_full = decode_and_validate_filename(meta_full, rep, strict=strict)
-        if not decoded_full:
-            # strict mode: reject broken decoding/validation
+        decoded_name = decode_filename(meta_name_raw, rep, strict)
+        if not decoded_name:
             rep.skipped_bad_meta += 1
             continue
 
-        # If meta says extension explicitly, ensure it matches the file in data/ (safety).
-        meta_ext = meta.get("Extension")
-        if isinstance(meta_ext, str) and meta_ext.strip():
-            meta_ext_norm = meta_ext.strip().lower().lstrip(".")
-            if meta_ext_norm != src_ext:
-                rep.skipped_extension_mismatch += 1
-                continue
-
-        # Also ensure decoded_full extension matches src file extension; if not, skip.
-        decoded_ext = Path(decoded_full).suffix.lower().lstrip(".")
-        if decoded_ext and decoded_ext != src_ext:
+        if Path(decoded_name).suffix.lower().lstrip(".") != src_ext:
             rep.skipped_extension_mismatch += 1
             continue
 
-        target_path, collided = safe_target_path(data_dir, decoded_full)
+        target, collided = safe_target_path(processed_dir, decoded_name, overwrite)
         if collided:
             rep.name_collisions_resolved += 1
 
-        # If already correct name (same path), do nothing
-        if target_path.resolve() == src_path.resolve():
-            continue
-
-        rep.renamed += 1
+        rep.copied_to_processed += 1
         if not dry_run:
-            src_path.rename(target_path)
+            target.write_bytes(src.read_bytes())
 
     return rep
 
 
-def dedupe_files_in_data_dir(data_dir: Path, dry_run: bool, rep: Report) -> None:
-    files = sorted([p for p in data_dir.iterdir() if p.is_file()])
+def dedupe_processed(processed_dir: Path, dry_run: bool, rep: Report):
     seen: Dict[str, Path] = {}
-
-    for p in files:
-        h = sha256_file(p)
+    for f in sorted(p for p in processed_dir.iterdir() if p.is_file()):
+        h = sha256_file(f)
         if h in seen:
-            kept = seen[h]
             rep.duplicates_removed += 1
-            rep.duplicates.append((p.name, kept.name))
+            rep.duplicates.append((f.name, seen[h].name))
             if not dry_run:
-                p.unlink()
+                f.unlink()
         else:
-            seen[h] = p
+            seen[h] = f
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description=(
-            "Step 1: rename data/<numer_id>.<ext> using imeta/<numer_id>.json FullFilename (URL-decode + NFC).\n"
-            "Step 2: remove binary duplicates in data/ (sha256).\n"
-            "Step 3: print report."
-        )
-    )
-    ap.add_argument("--data", default="data", help="Directory with binary files (default: data)")
-    ap.add_argument("--meta", default="imeta", help="Directory with meta JSON files (default: imeta)")
-    ap.add_argument("--dry-run", action="store_true", help="Do not modify files, only print what would happen")
-    ap.add_argument(
-        "--strict",
-        action="store_true",
-        help="Strict decoding/validation: skip files if URL-decoding fails or leftover %%XX remains after decode",
-    )
+    ap = argparse.ArgumentParser("Rename + normalize + dedupe into processed/")
+    ap.add_argument("--data", default="data")
+    ap.add_argument("--meta", default="imeta")
+    ap.add_argument("--processed", default="processed")
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    data_dir = Path(args.data)
-    meta_dir = Path(args.meta)
+    rep = process_files(
+        Path(args.data),
+        Path(args.meta),
+        Path(args.processed),
+        overwrite=args.overwrite,
+        strict=args.strict,
+        dry_run=args.dry_run,
+    )
 
-    if not data_dir.is_dir():
-        raise SystemExit(f"ERROR: data dir not found: {data_dir}")
-    if not meta_dir.is_dir():
-        raise SystemExit(f"ERROR: meta dir not found: {meta_dir}")
-
-    rep = rename_files(data_dir, meta_dir, dry_run=args.dry_run, strict=args.strict)
-    dedupe_files_in_data_dir(data_dir, dry_run=args.dry_run, rep=rep)
+    dedupe_processed(Path(args.processed), args.dry_run, rep)
 
     print("\n=== REPORT ===")
-    print(f"Data dir:  {data_dir.resolve()}")
-    print(f"Meta dir:  {meta_dir.resolve()}")
-    print(f"Dry-run:   {args.dry_run}")
-    print(f"Strict:    {args.strict}")
-    print("")
-    print(f"Files found in data/:            {rep.files_found_in_data}")
-    print(f"Renamed:                        {rep.renamed}")
-    print(f"Skipped (no meta):              {rep.skipped_no_meta}")
-    print(f"Skipped (bad meta / decode):    {rep.skipped_bad_meta}")
-    print(f"Skipped (missing FullFilename): {rep.skipped_missing_fullfilename}")
-    print(f"Skipped (extension mismatch):   {rep.skipped_extension_mismatch}")
-    print(f"Name collisions resolved:       {rep.name_collisions_resolved}")
-    print("")
-    print(f"URL-decoded filenames:          {rep.url_decoded}")
-    print(f"Decode failures:                {rep.decode_failures}")
-    print(f"Leftover %XX after decode:      {rep.decode_leftover_percent}")
-    if rep.decode_leftover_percent_examples:
-        print("Examples (original -> decoded):")
-        for ex in rep.decode_leftover_percent_examples:
-            print(f"- {ex}")
-    print("")
-    print(f"Duplicates removed (sha256):    {rep.duplicates_removed}")
-    if rep.duplicates_removed:
-        print("\nRemoved duplicates (removed -> kept):")
-        for removed, kept in rep.duplicates:
-            print(f"- {removed} -> {kept}")
+    print(f"Data files found:        {rep.files_found_in_data}")
+    print(f"Copied to processed/:   {rep.copied_to_processed}")
+    print(f"Skipped (no meta):      {rep.skipped_no_meta}")
+    print(f"Skipped (bad meta):     {rep.skipped_bad_meta}")
+    print(f"Skipped (ext mismatch): {rep.skipped_extension_mismatch}")
+    print(f"Collisions resolved:    {rep.name_collisions_resolved}")
+    print()
+    print(f"URL decoded names:      {rep.url_decoded}")
+    print(f"Decode failures:       {rep.decode_failures}")
+    print(f"Leftover %XX:          {rep.leftover_percent}")
+    for ex in rep.leftover_examples:
+        print(f"  - {ex}")
+    print()
+    print(f"Duplicates removed:     {rep.duplicates_removed}")
+    for r, k in rep.duplicates:
+        print(f"  - {r} -> {k}")
 
     return 0
 
