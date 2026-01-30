@@ -1,0 +1,670 @@
+use clap::Parser;
+use filetime::{set_file_times, FileTime};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
+
+static PERCENT_ESC_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"%[0-9A-Fa-f]{2}").unwrap());
+
+#[derive(Debug, Default)]
+struct Report {
+    files_found: usize,
+
+    copied_raw: u64, // only safe mode
+    dedup_removed: u64,
+    dedup_removed_examples: Vec<(String, String)>,
+
+    renamed: u64,
+    skipped_no_meta: u64,
+    skipped_bad_meta: u64,
+    skipped_extension_mismatch: u64,
+    rename_collisions_resolved: u64,
+
+    url_decoded: u64,
+    decode_failures: u64,
+    leftover_percent: u64,
+    leftover_examples: Vec<String>,
+}
+
+struct Tee {
+    w: BufWriter<File>,
+}
+
+impl Tee {
+    fn new(report_path: &Path) -> std::io::Result<Self> {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(report_path)?;
+        Ok(Self { w: BufWriter::new(f) })
+    }
+
+    fn close(mut self) {
+        let _ = self.w.flush();
+        // drop closes file
+    }
+
+    fn println(&mut self, msg: &str) {
+        println!("{msg}");
+        let _ = writeln!(self.w, "{msg}");
+    }
+
+    fn file_action(&mut self, filename: &str, numer_id: &str, action: &str, details: &str) {
+        let mut line = format!("FILE | numer_id={numer_id} | file={filename} | action={action}");
+        if !details.is_empty() {
+            line.push_str(&format!(" | details={details}"));
+        }
+        self.println(&line);
+    }
+}
+
+fn sha256_file(path: &Path, chunk_size: usize) -> String {
+    let mut h = Sha256::new();
+    let mut f = File::open(path).unwrap();
+    let mut buf = vec![0u8; chunk_size];
+    loop {
+        let n = f.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn load_meta_filename(meta_path: &Path) -> Option<String> {
+    let txt = fs::read_to_string(meta_path).ok()?;
+    let v: Value = serde_json::from_str(&txt).ok()?;
+
+    if let Some(full) = v.get("FullFilename").and_then(|x| x.as_str()) {
+        let s = full.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+
+    let fn_ = v.get("Filename").and_then(|x| x.as_str()).map(|s| s.trim().to_string());
+    let ext = v.get("Extension").and_then(|x| x.as_str()).map(|s| s.trim().to_string());
+
+    match (fn_, ext) {
+        (Some(f), Some(e)) if !f.is_empty() && !e.is_empty() => {
+            let e2 = e.trim_start_matches('.').to_string();
+            Some(format!("{f}.{e2}"))
+        }
+        _ => None,
+    }
+}
+
+/// Percent-decode like urllib.parse.unquote (NOT unquote_plus):
+/// - decodes only valid %HH sequences
+/// - leaves invalid % sequences as literal bytes
+/// - then decodes as UTF-8 (strict), error if invalid
+fn unquote_strict_like_python(raw: &str) -> Result<String, ()> {
+    let b = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h1 = b[i + 1];
+            let h2 = b[i + 2];
+            let is_hex = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F');
+            if is_hex(h1) && is_hex(h2) {
+                let v1 = (h1 as char).to_digit(16).unwrap();
+                let v2 = (h2 as char).to_digit(16).unwrap();
+                out.push(((v1 << 4) | v2) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+
+    String::from_utf8(out).map_err(|_| ())
+}
+
+fn basename_like_python_path_name(s: &str) -> String {
+    // Python: Path(decoded).name, with trailing separators ignored.
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "".to_string();
+    }
+    match trimmed.rsplit('/').next() {
+        Some(name) => name.to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+fn decode_filename(raw_in: &str, rep: &mut Report, strict: bool) -> Option<String> {
+    let raw = raw_in.trim().replace('\\', "/");
+
+    let decoded_full = match unquote_strict_like_python(&raw) {
+        Ok(d) => {
+            if d != raw {
+                rep.url_decoded += 1;
+            }
+            d
+        }
+        Err(_) => {
+            rep.decode_failures += 1;
+            if strict {
+                return None;
+            }
+            raw.clone()
+        }
+    };
+
+    let mut decoded = basename_like_python_path_name(&decoded_full);
+    decoded = decoded.nfc().collect::<String>();
+
+    if PERCENT_ESC_RE.is_match(&decoded) {
+        rep.leftover_percent += 1;
+        if rep.leftover_examples.len() < 10 {
+            rep.leftover_examples.push(format!("{raw} -> {decoded}"));
+        }
+        if strict {
+            return None;
+        }
+    }
+
+    Some(decoded)
+}
+
+fn safe_target_path(dir_: &Path, desired_name: &str) -> (PathBuf, bool) {
+    let target = dir_.join(desired_name);
+    if !target.exists() {
+        return (target, false);
+    }
+
+    let desired = Path::new(desired_name);
+    let stem = desired
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "".to_string());
+    let suffix = desired
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_else(|| "".to_string());
+
+    let mut n = 1;
+    loop {
+        let candidate = dir_.join(format!("{stem} ({n}){suffix}"));
+        if !candidate.exists() {
+            return (candidate, true);
+        }
+        n += 1;
+    }
+}
+
+fn copy2_like(src: &Path, dst: &Path) {
+    fs::copy(src, dst).unwrap();
+
+    // copy permissions
+    let meta = fs::metadata(src).unwrap();
+    let perms = meta.permissions();
+    fs::set_permissions(dst, perms).unwrap();
+
+    // copy times (best-effort like shutil.copy2)
+    if let Ok(m) = fs::metadata(src) {
+        let at = FileTime::from_last_access_time(&m);
+        let mt = FileTime::from_last_modification_time(&m);
+        let _ = set_file_times(dst, at, mt);
+    }
+}
+
+fn copy_raw_snapshot(
+    data_dir: &Path,
+    processed_dir: &Path,
+    dry_run: bool,
+    debug: bool,
+    log: &mut Tee,
+    rep: &mut Report,
+) {
+    fs::create_dir_all(processed_dir).unwrap();
+    let mut files: Vec<PathBuf> = data_dir
+        .read_dir()
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    rep.files_found = files.len();
+
+    for src in files {
+        let numer_id = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "".to_string());
+
+        let src_name = src.file_name().unwrap().to_string_lossy().to_string();
+        let dst = processed_dir.join(&src_name);
+
+        // in safe mode: do NOT overwrite existing snapshot
+        if dst.exists() {
+            log.file_action(
+                &src_name,
+                &numer_id,
+                "SKIP_COPY_EXISTS",
+                &format!("processed_has={}", dst.file_name().unwrap().to_string_lossy()),
+            );
+            if debug {
+                log.println(&format!("[SKIP copy] {src_name} -> {} exists", dst.file_name().unwrap().to_string_lossy()));
+            }
+            continue;
+        }
+
+        log.file_action(
+            &src_name,
+            &numer_id,
+            if dry_run { "WOULD_COPY_RAW" } else { "COPY_RAW" },
+            &format!("to={}", dst.file_name().unwrap().to_string_lossy()),
+        );
+        if debug {
+            log.println(&format!(
+                "[COPY raw] {src_name} -> {}",
+                dst.file_name().unwrap().to_string_lossy()
+            ));
+        }
+
+        rep.copied_raw += 1;
+        if !dry_run {
+            copy2_like(&src, &dst);
+        }
+    }
+}
+
+fn dedupe_dir_inplace(
+    dir_: &Path,
+    dry_run: bool,
+    debug: bool,
+    log: &mut Tee,
+    rep: &mut Report,
+    action_prefix: &str,
+) {
+    let mut files: Vec<PathBuf> = dir_
+        .read_dir()
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let mut by_hash: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for p in files {
+        let h = sha256_file(&p, 1024 * 1024);
+        let entry = by_hash.entry(h.clone()).or_insert_with(|| {
+            order.push(h.clone());
+            Vec::new()
+        });
+        entry.push(p);
+    }
+
+    let mut removed_count: u64 = 0;
+    let mut removed_examples: Vec<(String, String)> = Vec::new();
+
+    for h in order {
+        let group = by_hash.get(&h).unwrap();
+        if group.len() <= 1 {
+            continue;
+        }
+
+        let mut group_sorted = group.clone();
+        group_sorted.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        let keep = group_sorted[0].clone();
+        let keep_name = keep.file_name().unwrap().to_string_lossy().to_string();
+
+        for dup in group_sorted.into_iter().skip(1) {
+            let dup_name = dup.file_name().unwrap().to_string_lossy().to_string();
+            removed_count += 1;
+
+            if removed_examples.len() < 50 {
+                removed_examples.push((dup_name.clone(), keep_name.clone()));
+            }
+
+            let numer_id = dup
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "".to_string());
+
+            log.file_action(
+                &dup_name,
+                &numer_id,
+                &format!("{action_prefix}_REMOVED"),
+                &format!("same_as={keep_name}"),
+            );
+            if debug {
+                log.println(&format!(
+                    "[DEDUP {}] remove {dup_name} (same as {keep_name})",
+                    dir_.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            if !dry_run {
+                fs::remove_file(&dup).unwrap();
+            }
+        }
+    }
+
+    rep.dedup_removed += removed_count;
+    rep.dedup_removed_examples.extend(removed_examples);
+}
+
+fn rename_in_dir(
+    work_dir: &Path,
+    meta_dir: &Path,
+    strict: bool,
+    dry_run: bool,
+    debug: bool,
+    log: &mut Tee,
+    rep: &mut Report,
+) {
+    let mut files: Vec<PathBuf> = work_dir
+        .read_dir()
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for src in files {
+        let src_name = src.file_name().unwrap().to_string_lossy().to_string();
+        let numer_id = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "".to_string());
+
+        let src_ext = src
+            .extension()
+            .map(|e| e.to_string_lossy().to_string().to_lowercase())
+            .unwrap_or_else(|| "".to_string());
+
+        let meta_path = meta_dir.join(format!("{numer_id}.json"));
+        if !meta_path.exists() {
+            rep.skipped_no_meta += 1;
+            log.file_action(
+                &src_name,
+                &numer_id,
+                "SKIP_NO_META",
+                &format!("expected={}", meta_path.file_name().unwrap().to_string_lossy()),
+            );
+            if debug {
+                log.println(&format!(
+                    "[SKIP no-meta] {src_name} -> expected {}",
+                    meta_path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            continue;
+        }
+
+        let raw_name = load_meta_filename(&meta_path);
+        if raw_name.is_none() {
+            rep.skipped_bad_meta += 1;
+            log.file_action(
+                &src_name,
+                &numer_id,
+                "SKIP_BAD_META",
+                "missing FullFilename/Filename+Extension",
+            );
+            if debug {
+                log.println(&format!(
+                    "[SKIP bad-meta] {src_name} -> missing FullFilename/Filename+Extension in {}",
+                    meta_path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            continue;
+        }
+        let raw_name = raw_name.unwrap();
+
+        let canonical_name = decode_filename(&raw_name, rep, strict);
+        if canonical_name.is_none() {
+            rep.skipped_bad_meta += 1;
+            log.file_action(&src_name, &numer_id, "SKIP_DECODE_FAIL", &format!("raw={raw_name}"));
+            if debug {
+                log.println(&format!(
+                    "[SKIP decode] {src_name} -> decode/validation failed for: {raw_name}"
+                ));
+            }
+            continue;
+        }
+        let canonical_name = canonical_name.unwrap();
+
+        let can_ext = Path::new(&canonical_name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_string().to_lowercase())
+            .unwrap_or_else(|| "".to_string());
+
+        if can_ext != src_ext {
+            rep.skipped_extension_mismatch += 1;
+            log.file_action(
+                &src_name,
+                &numer_id,
+                "SKIP_EXT_MISMATCH",
+                &format!("src_ext={src_ext}, meta={canonical_name}"),
+            );
+            if debug {
+                log.println(&format!(
+                    "[SKIP ext-mismatch] {src_name} ({src_ext}) vs meta '{canonical_name}' ({can_ext})"
+                ));
+            }
+            continue;
+        }
+
+        let desired = work_dir.join(&canonical_name);
+
+        if desired == src {
+            log.file_action(&src_name, &numer_id, "ALREADY_CANONICAL", &format!("name={canonical_name}"));
+            continue;
+        }
+
+        if desired.exists() {
+            let (target, _) = safe_target_path(work_dir, &canonical_name);
+            rep.rename_collisions_resolved += 1;
+            log.file_action(
+                &src_name,
+                &numer_id,
+                "RENAME_COLLISION",
+                &format!(
+                    "to={}, canonical={}",
+                    target.file_name().unwrap().to_string_lossy(),
+                    canonical_name
+                ),
+            );
+            if debug {
+                log.println(&format!(
+                    "[RENAME collision] {src_name} -> {} (canonical exists)",
+                    target.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            if !dry_run {
+                fs::rename(&src, &target).unwrap();
+            }
+            rep.renamed += 1;
+        } else {
+            log.file_action(
+                &src_name,
+                &numer_id,
+                if dry_run { "WOULD_RENAME" } else { "RENAME" },
+                &format!("to={canonical_name}"),
+            );
+            if debug {
+                log.println(&format!("[RENAME] {src_name} -> {canonical_name}"));
+            }
+            if !dry_run {
+                fs::rename(&src, &desired).unwrap();
+            }
+            rep.renamed += 1;
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    about = "Default (safe): data/ unchanged; snapshot->processed; dedupe+rename in processed.\n--overwrite (in-place): dedupe+rename directly in data; processed is ignored.\nAlways writes report to report.txt."
+)]
+struct Args {
+    #[arg(long, default_value = "data")]
+    data: String,
+
+    #[arg(long, default_value = "imeta")]
+    meta: String,
+
+    #[arg(long, default_value = "processed")]
+    processed: String,
+
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    overwrite: bool,
+
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    strict: bool,
+
+    #[arg(long = "dry-run", action = clap::ArgAction::SetTrue)]
+    dry_run: bool,
+
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    debug: bool,
+}
+
+fn run() -> i32 {
+    let args = Args::parse();
+
+    let data_dir = PathBuf::from(&args.data);
+    let meta_dir = PathBuf::from(&args.meta);
+    let processed_dir = PathBuf::from(&args.processed);
+
+    if !data_dir.is_dir() {
+        eprintln!(
+            "ERROR: data dir not found: {}",
+            data_dir.canonicalize().unwrap_or(data_dir).display()
+        );
+        return 1;
+    }
+    if !meta_dir.is_dir() {
+        eprintln!(
+            "ERROR: meta dir not found: {}",
+            meta_dir.canonicalize().unwrap_or(meta_dir).display()
+        );
+        return 1;
+    }
+
+    let mut rep = Report::default();
+    let mut log = Tee::new(Path::new("report.txt")).unwrap();
+
+    // header
+    log.println(&format!(
+        "Data:      {}",
+        data_dir.canonicalize().unwrap_or(data_dir.clone()).display()
+    ));
+    log.println(&format!(
+        "Meta:      {}",
+        meta_dir.canonicalize().unwrap_or(meta_dir.clone()).display()
+    ));
+    log.println(&format!(
+        "Processed: {}",
+        processed_dir
+            .canonicalize()
+            .unwrap_or(processed_dir.clone())
+            .display()
+    ));
+    log.println(&format!(
+        "Dry-run:   {}  Strict: {}  Overwrite: {}  Debug: {}",
+        args.dry_run, args.strict, args.overwrite, args.debug
+    ));
+    log.println("");
+
+    if args.overwrite {
+        let work_dir = data_dir.clone();
+
+        log.println("=== MODE: OVERWRITE (IN-PLACE in data/) ===");
+        log.println("=== STEP 1: DEDUPE data/ (sha256) ===");
+        rep.files_found = data_dir
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .count();
+        dedupe_dir_inplace(&work_dir, args.dry_run, args.debug, &mut log, &mut rep, "DEDUP_DATA");
+        log.println("");
+
+        log.println("=== STEP 2: RENAME in data/ from meta ===");
+        rename_in_dir(&work_dir, &meta_dir, args.strict, args.dry_run, args.debug, &mut log, &mut rep);
+        log.println("");
+    } else {
+        let work_dir = processed_dir.clone();
+
+        log.println("=== MODE: SAFE (data/ unchanged; work in processed/) ===");
+        log.println("=== STEP 0: COPY RAW data/ -> processed/ ===");
+        copy_raw_snapshot(&data_dir, &processed_dir, args.dry_run, args.debug, &mut log, &mut rep);
+        log.println("");
+
+        log.println("=== STEP 1: DEDUPE processed/ (sha256) ===");
+        dedupe_dir_inplace(&work_dir, args.dry_run, args.debug, &mut log, &mut rep, "DEDUP_PROCESSED");
+        log.println("");
+
+        log.println("=== STEP 2: RENAME in processed/ from meta ===");
+        rename_in_dir(&work_dir, &meta_dir, args.strict, args.dry_run, args.debug, &mut log, &mut rep);
+        log.println("");
+    }
+
+    log.println("=== REPORT SUMMARY ===");
+    log.println(&format!(
+        "Files found (source scan):            {}",
+        rep.files_found
+    ));
+    if !args.overwrite {
+        log.println(&format!(
+            "Copied raw to processed/:             {}",
+            rep.copied_raw
+        ));
+    }
+    log.println(&format!("Duplicates removed:                   {}", rep.dedup_removed));
+    if !rep.dedup_removed_examples.is_empty() {
+        log.println("Examples (removed -> kept):");
+        for (r, k) in &rep.dedup_removed_examples {
+            log.println(&format!("  - {r} -> {k}"));
+        }
+    }
+    log.println("");
+    log.println(&format!("Renamed:                              {}", rep.renamed));
+    log.println(&format!("Skipped (no meta):                    {}", rep.skipped_no_meta));
+    log.println(&format!("Skipped (bad meta/decode):            {}", rep.skipped_bad_meta));
+    log.println(&format!(
+        "Skipped (extension mismatch):         {}",
+        rep.skipped_extension_mismatch
+    ));
+    log.println(&format!(
+        "Rename collisions resolved:           {}",
+        rep.rename_collisions_resolved
+    ));
+    log.println("");
+    log.println(&format!("URL decoded names:                    {}", rep.url_decoded));
+    log.println(&format!("Decode failures:                      {}", rep.decode_failures));
+    log.println(&format!(
+        "Leftover %XX after decode:            {}",
+        rep.leftover_percent
+    ));
+    for ex in &rep.leftover_examples {
+        log.println(&format!("  - {ex}"));
+    }
+
+    log.close();
+    0
+}
+
+fn main() {
+    std::process::exit(run());
+}
