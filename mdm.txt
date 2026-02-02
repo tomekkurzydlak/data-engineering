@@ -1,20 +1,10 @@
 // src/internals/md_postprocess.rs
-//
-// Post-processing markdown output.
-// - mark_headings(): CAPS + krótkie + puste linie nad/pod -> # / ##
-// - normalize_years(): skleja "rozsypane" lata
-//   * poza tabelą: normalna zamiana do "YYYY r."
-//   * w tabeli (między pipe '|'): zachowuje dokładnie tę samą długość komórki
-// - postprocess_markdownify(): pipeline (years -> headings)
 
 pub fn postprocess_markdownify(md: &str) -> String {
     let md = normalize_years(md);
+    let md = normalize_currencies(&md);
     mark_headings(&md)
 }
-
-// ------------------------------------------------------------
-// HEADINGS
-// ------------------------------------------------------------
 
 pub fn mark_headings(md: &str) -> String {
     let lines: Vec<&str> = md.lines().collect();
@@ -71,89 +61,48 @@ fn normalize_heading(line: &str) -> String {
         .join(" ")
 }
 
-// ------------------------------------------------------------
-// YEARS
-// ------------------------------------------------------------
-
-/// Normalizuje "rozsypane" lata do formatu "YYYY r." (poza tabelą),
-/// a w tabeli (między '|') zachowuje *identyczną* długość komórki.
-///
-/// Przykłady (jeśli obok cyfr jest 'r' / 'r.'):
-/// - "202  6 r" -> "2026 r."
-/// - "202-9 r." -> "2029 r."
-/// - "---203-6-- r." -> "2036 r."
-/// - "--20-37--r" -> "2037 r."
-///
-/// Zasada tabel:
-/// - w obrębie pojedynczej komórki (tekst między kolejnymi '|') po podmianie
-///   długość komórki musi pozostać taka sama (żeby nie przesunąć pipe).
 pub fn normalize_years(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
-
     for line in md.split_inclusive('\n') {
         out.push_str(&normalize_years_in_line(line));
     }
-
-    // jeśli ostatnia linia nie miała '\n'
-    if !md.ends_with('\n') {
-        if let Some(last) = md.lines().last() {
-            // split_inclusive nie zwrócił ostatniej bez '\n' jeśli jej nie ma; ale my już ją mieliśmy w md.lines()
-            // żeby nie dublować, nic nie rób — to jest tylko asekuracja, w praktyce split_inclusive ogarnia to poprawnie
-            let _ = last;
-        }
-    }
-
     out
 }
 
 fn normalize_years_in_line(line: &str) -> String {
-    // Heurystyka wykrycia "linii tabeli":
-    // - zawiera pipe '|'
-    // - i nie wygląda jak code fence
-    // Nie próbujemy 100% parsera MD — tylko celujemy w typowe tabele.
     let looks_like_table = line.contains('|') && !line.trim_start().starts_with("```");
-
     if !looks_like_table {
         return normalize_years_free(line);
     }
 
-    // Przetwarzamy segmenty między pipe'ami, zachowując pipe'y dokładnie.
-    // Uwaga: line może zawierać '\n' (split_inclusive), więc traktujemy go jak zwykły znak.
     let mut out = String::with_capacity(line.len());
-    let mut current_cell = String::new();
+    let mut cell = String::new();
     let mut in_cell = false;
 
     for ch in line.chars() {
         if ch == '|' {
-            // Flush poprzedniej komórki
             if in_cell {
-                let fixed = normalize_years_cell_preserve_width(&current_cell);
-                out.push_str(&fixed);
-                current_cell.clear();
+                out.push_str(&normalize_years_cell_preserve_width(&cell));
+                cell.clear();
             }
-            // Pipe zostaje
             out.push('|');
             in_cell = true;
         } else {
             if in_cell {
-                current_cell.push(ch);
+                cell.push(ch);
             } else {
-                // zanim pierwszy '|' — zostawiamy jak jest
                 out.push(ch);
             }
         }
     }
 
-    // Flush ostatniej komórki (po ostatnim '|', jeśli była)
     if in_cell {
-        let fixed = normalize_years_cell_preserve_width(&current_cell);
-        out.push_str(&fixed);
+        out.push_str(&normalize_years_cell_preserve_width(&cell));
     }
 
     out
 }
 
-/// Normalizacja roku w tekście "wolnym" (poza tabelą) — może zmieniać długość.
 fn normalize_years_free(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -169,7 +118,6 @@ fn normalize_years_free(s: &str) -> String {
         let start = i;
         let mut j = i;
 
-        // segment = cyfry + separatory, bez liter
         while j < chars.len() {
             let c = chars[j];
             if c.is_ascii_alphanumeric() {
@@ -177,7 +125,7 @@ fn normalize_years_free(s: &str) -> String {
                     j += 1;
                     continue;
                 } else {
-                    break; // litera kończy segment
+                    break;
                 }
             }
             j += 1;
@@ -207,7 +155,6 @@ fn normalize_years_free(s: &str) -> String {
             continue;
         }
 
-        // warunek "r" w max 3 znakach po ostatniej cyfrze w oryginalnym stringu
         let last_digit_pos = find_last_digit_pos(&chars, start, j).unwrap_or(j.saturating_sub(1));
         if !has_r_within_3(&chars, last_digit_pos) {
             out.push(chars[i]);
@@ -215,27 +162,17 @@ fn normalize_years_free(s: &str) -> String {
             continue;
         }
 
-        out.push_str(&format!("{} r.", year));
-
-        // przeskocz segment + zjedz " r." / "r." / "r"
+        out.push_str(&format!("{} r", year));
         i = j;
         i = consume_r_suffix(&chars, i, 3);
-
-        continue;
     }
 
     out
 }
 
-/// Normalizuje lata w komórce tabeli, ale **zachowuje dokładnie tę samą długość komórki**.
-/// To znaczy: po podmianie ilość znaków w `cell` nie zmienia się.
-/// Jeśli podmiana skraca, dopadujemy spacjami.
-/// Jeśli podmiana byłaby dłuższa niż fragment do podmiany — próbujemy krótszej formy, a jak się nie da, nie podmieniamy.
-///
-/// Uwaga: liczymy "długość" po znakach ASCII (chars). Dla typowego MD (cyfry/spacje/-/|) to jest bezpieczne.
 fn normalize_years_cell_preserve_width(cell: &str) -> String {
     let chars: Vec<char> = cell.chars().collect();
-    let mut out: Vec<char> = chars.clone(); // będziemy modyfikować "in place" przez nadpisywanie zakresów
+    let mut out: Vec<char> = chars.clone();
     let mut i = 0;
 
     while i < chars.len() {
@@ -247,7 +184,6 @@ fn normalize_years_cell_preserve_width(cell: &str) -> String {
         let start = i;
         let mut j = i;
 
-        // segment w komórce: cyfry + separatory, bez liter
         while j < chars.len() {
             let c = chars[j];
             if c.is_ascii_alphanumeric() {
@@ -261,7 +197,6 @@ fn normalize_years_cell_preserve_width(cell: &str) -> String {
             j += 1;
         }
 
-        // segment = [start, j)
         let segment: String = chars[start..j].iter().collect();
         let digits: String = segment.chars().filter(|c| c.is_ascii_digit()).collect();
 
@@ -289,8 +224,6 @@ fn normalize_years_cell_preserve_width(cell: &str) -> String {
             continue;
         }
 
-        // Chcemy podmienić możliwie cały "blob" roku + ewentualne " r." zaraz po nim,
-        // ale NIE wyjść poza komórkę.
         let mut replace_end = j;
         replace_end = consume_r_suffix(&chars, replace_end, 3);
 
@@ -300,53 +233,241 @@ fn normalize_years_cell_preserve_width(cell: &str) -> String {
             continue;
         }
 
-        // Preferowana forma
         let candidates = [
             format!("{} r.", year),
             format!("{} r", year),
             format!("{}r", year),
         ];
 
-        // wybierz najdłuższą, która się zmieści; potem dopaduj spacjami do dokładnego target_len
         let mut chosen: Option<String> = None;
         for c in candidates.iter() {
             if c.chars().count() <= target_len {
                 chosen = Some(c.clone());
-                break; // candidates są od najdłuższego do najkrótszego
+                break;
             }
         }
 
         let Some(mut rep) = chosen else {
-            // nie da się zmieścić — nie dotykamy
             i += 1;
             continue;
         };
 
-        // dopaduj spacjami do target_len
         let rep_len = rep.chars().count();
         if rep_len < target_len {
             rep.push_str(&" ".repeat(target_len - rep_len));
         } else if rep_len > target_len {
-            // nie powinno się zdarzyć, bo sprawdziliśmy, ale zostawmy bezpiecznik
             rep = rep.chars().take(target_len).collect();
         }
 
-        // Nadpisz zakres [start, replace_end) w out
         let rep_chars: Vec<char> = rep.chars().collect();
         for k in 0..target_len {
             out[start + k] = rep_chars[k];
         }
 
-        // Przeskocz za zastąpionym zakresem
         i = replace_end;
     }
 
     out.into_iter().collect()
 }
 
-// ------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------
+pub fn normalize_currencies(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    for line in md.split_inclusive('\n') {
+        out.push_str(&normalize_currencies_in_line(line));
+    }
+    out
+}
+
+fn normalize_currencies_in_line(line: &str) -> String {
+    let looks_like_table = line.contains('|') && !line.trim_start().starts_with("```");
+    if !looks_like_table {
+        return normalize_currencies_free(line);
+    }
+
+    let mut out = String::with_capacity(line.len());
+    let mut cell = String::new();
+    let mut in_cell = false;
+
+    for ch in line.chars() {
+        if ch == '|' {
+            if in_cell {
+                out.push_str(&normalize_currencies_cell_preserve_width(&cell));
+                cell.clear();
+            }
+            out.push('|');
+            in_cell = true;
+        } else {
+            if in_cell {
+                cell.push(ch);
+            } else {
+                out.push(ch);
+            }
+        }
+    }
+
+    if in_cell {
+        out.push_str(&normalize_currencies_cell_preserve_width(&cell));
+    }
+
+    out
+}
+
+fn normalize_currencies_free(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        if !chars[i].is_alphabetic() && chars[i] != 'ł' && chars[i] != 'Ł' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        let mut j = i;
+
+        while j < chars.len() {
+            let c = chars[j];
+            if c.is_ascii_digit() {
+                break;
+            }
+            if c.is_alphabetic() || c == 'ł' || c == 'Ł' || is_currency_sep(c) {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+
+        let segment: String = chars[start..j].iter().collect();
+        if let Some(norm) = currency_norm_from_segment(&segment) {
+            out.push_str(&norm);
+            i = j;
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+fn normalize_currencies_cell_preserve_width(cell: &str) -> String {
+    let chars: Vec<char> = cell.chars().collect();
+    let mut out: Vec<char> = chars.clone();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c0 = chars[i];
+        if !c0.is_alphabetic() && c0 != 'ł' && c0 != 'Ł' {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        let mut j = i;
+
+        while j < chars.len() {
+            let c = chars[j];
+            if c.is_ascii_digit() {
+                break;
+            }
+            if c.is_alphabetic() || c == 'ł' || c == 'Ł' || is_currency_sep(c) {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+
+        let segment: String = chars[start..j].iter().collect();
+        let Some(norm) = currency_norm_from_segment(&segment) else {
+            i += 1;
+            continue;
+        };
+
+        let target_len = j.saturating_sub(start);
+        if target_len == 0 {
+            i += 1;
+            continue;
+        }
+
+        let candidates = currency_candidates(&norm);
+        let mut chosen: Option<String> = None;
+        for cand in candidates {
+            if cand.chars().count() <= target_len {
+                chosen = Some(cand);
+                break;
+            }
+        }
+
+        let Some(mut rep) = chosen else {
+            i += 1;
+            continue;
+        };
+
+        let rep_len = rep.chars().count();
+        if rep_len < target_len {
+            rep.push_str(&" ".repeat(target_len - rep_len));
+        } else if rep_len > target_len {
+            rep = rep.chars().take(target_len).collect();
+        }
+
+        let rep_chars: Vec<char> = rep.chars().collect();
+        for k in 0..target_len {
+            out[start + k] = rep_chars[k];
+        }
+
+        i = j;
+    }
+
+    out.into_iter().collect()
+}
+
+fn currency_candidates(norm: &str) -> Vec<String> {
+    if norm == "zł" {
+        vec!["zł".to_string(), "zl".to_string(), "PLN".to_string()]
+    } else {
+        vec![norm.to_string(), norm.to_lowercase()]
+    }
+}
+
+fn currency_norm_from_segment(segment: &str) -> Option<String> {
+    let letters: String = segment
+        .chars()
+        .filter(|c| c.is_alphabetic() || *c == 'ł' || *c == 'Ł')
+        .collect();
+
+    if letters.is_empty() {
+        return None;
+    }
+
+    let folded = letters.to_lowercase();
+
+    if folded == "zł" || folded == "zl" || folded == "pln" {
+        return Some("zł".to_string());
+    }
+
+    match folded.as_str() {
+        "eur" => Some("EUR".to_string()),
+        "usd" => Some("USD".to_string()),
+        "gbp" => Some("GBP".to_string()),
+        "chf" => Some("CHF".to_string()),
+        "czk" => Some("CZK".to_string()),
+        "nok" => Some("NOK".to_string()),
+        "sek" => Some("SEK".to_string()),
+        "dkk" => Some("DKK".to_string()),
+        "huf" => Some("HUF".to_string()),
+        "jpy" => Some("JPY".to_string()),
+        "cad" => Some("CAD".to_string()),
+        "aud" => Some("AUD".to_string()),
+        _ => None,
+    }
+}
+
+fn is_currency_sep(c: char) -> bool {
+    c.is_whitespace() || c == '-' || c == '_' || c == '.' || c == '/' || c == '—' || c == '–'
+}
 
 fn find_last_digit_pos(chars: &[char], start: usize, end: usize) -> Option<usize> {
     for idx in (start..end).rev() {
@@ -369,8 +490,6 @@ fn has_r_within_3(chars: &[char], last_digit_pos: usize) -> bool {
     false
 }
 
-/// Konsumuje do `max_chars` znaków po `idx` jeśli wyglądają na sufiks " r." / "r." / "r"
-/// (spacje, 'r'/'R', kropki). Zwraca nowe idx.
 fn consume_r_suffix(chars: &[char], mut idx: usize, max_chars: usize) -> usize {
     let mut consumed = 0;
     while idx < chars.len() && consumed < max_chars {
