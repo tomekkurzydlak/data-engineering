@@ -1,0 +1,142 @@
+<mxfile host="app.diagrams.net" modified="2026-02-03T00:00:00.000Z" agent="" version="24.7.5">
+  <diagram id="" name=" - Physical Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1920" pageHeight="1080" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Swimlane: External / Sources -->
+        <mxCell id="lane_ext" value="External / Sources" style="swimlane;whiteSpace=wrap;html=1;rounded=0;childLayout=stackLayout;horizontal=0;startSize=30;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="20" y="20" width="460" height="980" as="geometry"/>
+        </mxCell>
+
+        <!-- Swimlane: GCP -->
+        <mxCell id="lane_gcp" value="Google Cloud Platform (GCP)" style="swimlane;whiteSpace=wrap;html=1;rounded=0;childLayout=stackLayout;horizontal=0;startSize=30;fillColor=#eef5ff;strokeColor=#4a86e8;" vertex="1" parent="1">
+          <mxGeometry x="500" y="20" width="860" height="980" as="geometry"/>
+        </mxCell>
+
+        <!-- Swimlane: On-Prem -->
+        <mxCell id="lane_onprem" value="On-Prem (Corporate Network)" style="swimlane;whiteSpace=wrap;html=1;rounded=0;childLayout=stackLayout;horizontal=0;startSize=30;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="20" width="520" height="980" as="geometry"/>
+        </mxCell>
+
+        <!-- External nodes -->
+        <mxCell id="actor" value="Actor / Source System&#10;(uploads file)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="1" parent="lane_ext">
+          <mxGeometry x="60" y="90" width="340" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sharepoint" value="SharePoint (optional)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="1" parent="lane_ext">
+          <mxGeometry x="60" y="190" width="340" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- GCP nodes -->
+        <mxCell id="gcs_ingest" value="GCS Bucket: ingest&#10;(original files)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="60" y="90" width="360" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="gke_watcher" value="GKE: Orchestrator / Watchers&#10;(periodic scan for new files)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="60" y="190" width="360" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="pg" value="PostgreSQL (GCP)&#10;- metadata definitions&#10;- processing status" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="60" y="300" width="360" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="cloudrun_meta" value="Cloud Run: Step 1&#10;Meta Extractor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="480" y="130" width="320" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="cloudrun_pdf2md" value="Cloud Run: Step 2&#10;Document Processor&#10;(PDF2MD / DOCX / MD)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="480" y="230" width="320" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="cloudrun_writer" value="Cloud Run: Step 3&#10;Metadata Writer&#10;(merge + canonical JSON)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="480" y="360" width="320" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="gcs_artifacts" value="GCS: artifacts / metadata&#10;(stored next to file)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="480" y="480" width="320" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="pubsub" value="Pub/Sub Topic: file-metadata" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4a86e8;" vertex="1" parent="lane_gcp">
+          <mxGeometry x="60" y="520" width="360" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- On-prem nodes -->
+        <mxCell id="dispatcher" value="Dispatcher (on-prem)&#10;orchestrates steps&#10;polls Cloud Run status" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;" vertex="1" parent="lane_onprem">
+          <mxGeometry x="80" y="190" width="360" height="100" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="publisher" value="On-prem Publisher&#10;publishes metadata to Pub/Sub" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;" vertex="1" parent="lane_onprem">
+          <mxGeometry x="80" y="340" width="360" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="clients" value="Business Clients&#10;(Pub/Sub subscribers)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="1" parent="lane_onprem">
+          <mxGeometry x="80" y="520" width="360" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="actor" target="sharepoint">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e2" value="HTTPS/TLS (copy/transfer)" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="sharepoint" target="gcs_ingest">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e3" value="GCS API&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="gke_watcher" target="gcs_ingest">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e4" value="DB (TCP/TLS)" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="gke_watcher" target="pg">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e5" value="Trigger dispatcher&#10;HTTPS/TLS (VPN/Interconnect)" style="endArrow=block;html=1;rounded=0;strokeWidth=2;dashed=1;" edge="1" parent="1" source="gke_watcher" target="dispatcher">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e6" value="Start Step 1&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="dispatcher" target="cloudrun_meta">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e7" value="Start Step 2&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="dispatcher" target="cloudrun_pdf2md">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e8" value="Start Step 3&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="dispatcher" target="cloudrun_writer">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e9" value="Read/Write artifacts&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="cloudrun_meta" target="gcs_ingest">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e10" value="Read file + write MD&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="cloudrun_pdf2md" target="gcs_artifacts">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e11" value="Write canonical metadata&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="cloudrun_writer" target="gcs_artifacts">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e12" value="Poll status + save run status&#10;DB (TCP/TLS)" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="dispatcher" target="pg">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e13" value="Publish metadata&#10;HTTPS/TLS (VPN/Interconnect)" style="endArrow=block;html=1;rounded=0;strokeWidth=2;dashed=1;" edge="1" parent="1" source="publisher" target="pubsub">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e14" value="Trigger publish" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="dispatcher" target="publisher">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e15" value="Subscribe&#10;HTTPS/TLS" style="endArrow=block;html=1;rounded=0;strokeWidth=2;" edge="1" parent="1" source="pubsub" target="clients">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
