@@ -1,5 +1,5 @@
 <mxfile host="app.diagrams.net" modified="2026-02-03T00:00:00.000Z" agent="" version="24.7.5">
-  <diagram id="-netsec" name=" - Network & Trust Boundaries">
+  <diagram id="netsec" name="- Network & Trust Boundaries">
     <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1920" pageHeight="1080" math="0" shadow="0">
       <root>
         <mxCell id="0"/>
