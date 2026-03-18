@@ -1,0 +1,42 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+pub static WORD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"[A-Za-z0-9_ąćęłńóśżźĄĆĘŁŃÓŚŻŹ]+(?:[-'][A-Za-z0-9_ąćęłńóśżźĄĆĘŁŃÓŚŻŹ]+)?")
+        .expect("word regex")
+});
+pub static SENTENCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[.!?]+\s+").expect("sentence regex"));
+pub static HEADING_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(#{1,6})\s*(.*)$").expect("heading regex"));
+pub static LIST_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^\s*([-*+]\s+|\d+[.)]\s+)").expect("list regex"));
+pub static BROKEN_LIST_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^\s*[*+-](\S)").expect("broken list regex"));
+pub static CONTROL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]").expect("control regex"));
+
+#[derive(Clone, Debug)]
+pub struct ParsedDoc {
+    pub text: String,
+    pub lines: Vec<String>,
+    pub tokens: Vec<String>,
+    pub sentence_count: usize,
+}
+
+impl ParsedDoc {
+    pub fn from_text(text: String) -> Self {
+        let lines = text.lines().map(ToString::to_string).collect::<Vec<_>>();
+        let tokens = WORD_RE
+            .find_iter(&text)
+            .map(|m| m.as_str().to_string())
+            .collect::<Vec<_>>();
+        let sentence_count = SENTENCE_RE.find_iter(&text).count().max(1);
+        Self {
+            text,
+            lines,
+            tokens,
+            sentence_count,
+        }
+    }
+}
